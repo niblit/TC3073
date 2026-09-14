@@ -1,0 +1,17 @@
+
+Read one required paper in each of the first ten active weeks. The purpose column tells you which project decision the paper should influence. Period 3 has no required new paper.
+
+| Week | Required paper                                                                                      | Use it to decide                                                      | Link                                                                      |
+| :--- | :-------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| 1    | Goodfellow, Shlens & Szegedy (2015) Explaining and Harnessing Adversarial Examples                  | Understand why models are fooled by small, intent-preserving changes. | [01](https://arxiv.org/abs/1412.6572)                                     |
+| 2    | Biggio & Roli (2018) Wild Patterns: Ten Years After the Rise of Adversarial Machine Learning        | Frame evasion at test time as the core security threat.               | [02](https://arxiv.org/abs/1412.6572)                                     |
+| 3    | Carlini & Wagner (2017) Towards Evaluating the Robustness of Neural Networks                        | Learn how to evaluate robustness without fooling yourself.            | [03](https://arxiv.org/abs/1608.04644)                                    |
+| 4    | Ebrahimi et al. (2018) HotFlip: White-Box Adversarial Examples for Text Classification              | See how tiny token changes flip a text classifier.                    | [04](https://aclanthology.org/P18-2006/)                                  |
+| 5    | Jin et al. (2020) Is BERT Really Robust? A Strong Baseline for Natural Language Attack (TextFooler) | Design intent-preserving word-substitution attacks.                   | [05](https://arxiv.org/abs/1907.11932)                                    |
+| 6    | Morris et al. (2020) TextAttack: A Framework for Adversarial Attacks in NLP                         | Reuse a proven attack framework instead of building from scratch.     | [06](https://arxiv.org/abs/2005.05909)                                    |
+| 7    | Pierazzi et al. (2020) Intriguing Properties of Adversarial ML Attacks in the Problem Space         | Keep transformations valid, real objects - not just feature tweaks.   | [07](https://arxiv.org/abs/1911.02142)                                    |
+| 8    | Apruzzese et al. (2023) "Real Attackers Don't Compute Gradients": Bridging Research and Practice    | Ground the threat model in how attackers actually behave.             | [08](https://theory.stanford.edu/~dfreeman/papers/real_attackers.pdf)     |
+| 9    | Croce & Hein (2020) Reliable Evaluation of Adversarial Robustness (AutoAttack)                      | Avoid overestimating robustness with a weak attack.                   | [09](https://arxiv.org/abs/2003.01690)                                    |
+| 10   | Arp et al. (2022) Dos and Don'ts of Machine Learning in Computer Security                           | Audit your own evaluation for common security-ML pitfalls.            | [10](https://www.usenix.org/conference/usenixsecurity22/presentation/arp) |
+
+Access rule: Every paper above is open access (arXiv, ACL Anthology, USENIX, MDPI, or an author copy). Use the linked record; if a link fails, ask the supervisor for a copy.

@@ -1,0 +1,10 @@
+- What changed this week? Link or name the artifact.
+	- Read first paper and done [[0102 Assignment]]
+- What evidence supports the decision you made?
+	- The project description and the paper card one
+- Which feedback did you address?
+	- None yet
+- What failed or remains uncertain?
+	- The project remains with lots of uncertainity, I will look more into it
+- What will you do next week, and what decision or help do you need?
+	- Do not know yet

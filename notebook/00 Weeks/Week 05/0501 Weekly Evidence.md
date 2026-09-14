@@ -1,0 +1,20 @@
+- What changed this week? Link or name the artifact.
+	- I added intent preservation features to the work of week 4, by evaluating cosine closeness and using a hugging face model to evaluate embeddings
+	- Added a feature to save and load models, so you don't have to train them every single time
+	- Added evaluator entry point to the detector zoo, do accept text as input and output the detection score
+	- Added transformation entry point, to accept text and budget (0.0 -> 1.0) as a percentage of total change allowed, as input, and output a new text with intent preservation
+	- Added a new script to analyze the transformer performance on the detector zoo
+	- Did a run for the analysis, 10 steps on budget, 10 random samples, ran for 30 minutes, devastating results, the detection score remained at 100%, the transformer never evaded the detector
+	- I created a unified repo for the detector, the adversarial examples, the analysis and this Obsidian notebook
+	- I trained the detector zoo using the reduced dataset, because the full one included too much URLs, not useful for our purposes 
+- What evidence supports the decision you made?
+	- The new github repo, the code, the feedback
+- Which feedback did you address?
+	- Elivier's feedback on intent preservation
+- What failed or remains uncertain?
+	- Missing detectors on detector zoo
+	- Bad results on the current transformer
+- What will you do next week, and what decision or help do you need?
+	- Use [[05 - Is BERT Really Robust? A Strong Baseline for Natural Language Attackon Text Classification and Entailment]] information to generate a new approach on transformations
+	- Address pending feedback
+	

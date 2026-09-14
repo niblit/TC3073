@@ -1,0 +1,11 @@
+- What changed this week? Link or name the artifact.
+	- Created the paper card
+	- Created a python project for training models
+- What evidence supports the decision you made?
+	- [[0100 Main]]
+- Which feedback did you address?
+	- None
+- What failed or remains uncertain?
+	- What models to use, how to save them
+- What will you do next week, and what decision or help do you need?
+	- Finish training other models

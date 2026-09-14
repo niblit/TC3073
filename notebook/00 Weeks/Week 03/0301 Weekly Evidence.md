@@ -1,0 +1,10 @@
+- What changed this week? Link or name the artifact.
+	- Designed and implemented the structural taxonomy for adversarial transformations (`ContentTransformation`, `StructureTransformation`, `MetadataTransformation`) and built a strict `PerturbationBudget` tracker to ensure all future attacks are realistic and bounded. 
+- What evidence supports the decision you made?
+	- The `test_taxonomy.py` suite passes successfully, proving that transformations will inherently fail (via `BudgetExceededError`) if they attempt to violate the perturbation budget.
+- Which feedback did you address?
+	- None
+- What failed or remains uncertain?
+	- The exact conversion rate between different types of budgets (how to weigh 1 word swap against 1 HTML tag injection or one paragraph postion change).
+- What will you do next week, and what decision or help do you need?
+	- Implement the concrete content-level transformations (paraphrase, synonym substitution) inheriting from this new taxonomy.

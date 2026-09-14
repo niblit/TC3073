@@ -1,0 +1,10 @@
+- What changed this week? Link or name the artifact.
+	- Implemented a good prototype for content transformations
+- What evidence supports the decision you made?
+	- Source code
+- Which feedback did you address?
+	- None
+- What failed or remains uncertain?
+	- How to verify for intent preservation
+- What will you do next week, and what decision or help do you need?
+	- Maybe add LLM proccessing to the transformations

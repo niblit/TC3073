@@ -1,0 +1,10 @@
+- What changed this week? Link or name the artifact.
+	- 
+- What evidence supports the decision you made?
+	- 
+- Which feedback did you address?
+	- 
+- What failed or remains uncertain?
+	- 
+- What will you do next week, and what decision or help do you need?
+	-
