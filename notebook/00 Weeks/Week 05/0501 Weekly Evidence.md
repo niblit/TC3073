@@ -15,6 +15,6 @@
 	- Missing detectors on detector zoo
 	- Bad results on the current transformer
 - What will you do next week, and what decision or help do you need?
-	- Use [[05 - Is BERT Really Robust? A Strong Baseline for Natural Language Attackon Text Classification and Entailment]] information to generate a new approach on transformations
+	- Use [[05 - Is BERT Really Robust? A Strong Baseline for Natural Language Attack on Text Classification and Entailment]] information to generate a new approach on transformations
 	- Address pending feedback
 	
