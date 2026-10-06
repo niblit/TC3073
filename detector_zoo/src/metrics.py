@@ -13,12 +13,12 @@ def evaluate_model(y_true: List[int], y_pred: List[int]) -> Dict[str, float]:
     }
     return metrics
 
-def generate_report(metrics: Dict[str, float], seeds: Dict[str, Any]) -> str:
+def generate_report(metrics: Dict[str, float], seeds: Dict[str, Any], model_name: str = "BASELINE") -> str:
     """
-    Generates a formatted baseline report string.
+    Generates a formatted evaluation report string for a given model.
     """
     report = "========================================\n"
-    report += "BASELINE MODEL EVALUATION REPORT\n"
+    report += f"{model_name.upper()} MODEL EVALUATION REPORT\n"
     report += "========================================\n"
     report += "Reproducibility Parameters:\n"
     for k, v in seeds.items():

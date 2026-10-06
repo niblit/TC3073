@@ -1,0 +1,10 @@
+- What changed this week? Link or name the artifact.
+	- Implemented the formal `TextFoolerAttack` algorithm in `content_attacks.py`, heavily upgrading the previous synonym substitution baseline. I also created the initial structural files for `structure_attack.py` and `metadata_attack.py`.
+- What evidence supports the decision you made?
+	- To properly evaluate transformations, the content attack needed to query the model iteratively. Moving to the TextFooler algorithm provided a stronger, baseline-compliant adversarial attack that uses USE-based semantic similarity and dynamically ranks word importance via target model feedback.
+- Which feedback did you address?
+	- Addressed the need for a more robust content transformation strategy by integrating black-box oracle feedback directly into the perturbation loop.
+- What failed or remains uncertain?
+	- While the structure and metadata modules are stubbed out, implementing strict validity constraints for them is still in progress and will carry over into the next phase.
+- What will you do next week, and what decision or help do you need?
+	- Next week, I will finalize the harness protocol by expanding the detector zoo to ensure the oracle can interface with multiple model architectures.

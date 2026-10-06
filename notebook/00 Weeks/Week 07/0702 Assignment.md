@@ -1,0 +1,1 @@
+- Harness v1, featuring the integrated `detector_zoo`, the `predict.py` CLI oracle, and the `BaseDetector` API.

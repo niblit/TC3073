@@ -1,0 +1,10 @@
+- What changed this week? Link or name the artifact.
+	- Built out the full `detector_zoo` to include the Baseline (TF-IDF + Logistic Regression), CharCNN, and Transformer (DistilBERT) models under a unified `BaseDetector` interface. I also created `predict.py` to act as the CLI oracle for the attack harness.
+- What evidence supports the decision you made?
+	- Building out the full detector zoo early was necessary to build a functional measurement protocol. Having the CharCNN and Transformer models share a uniform `fit`/`predict` API allows the harness to dynamically swap models and run budgeted combination searches across different architectures.
+- Which feedback did you address?
+	- Resolved the roadmap drift by ensuring the harness v1 has the required target oracles to actually execute the combination searches. The `TargetedContentTransformation` base class now securely handles the model feedback.
+- What failed or remains uncertain?
+	- The formal combination search algorithm (budget × severity × seeds) across all three newly integrated models needs to be fully benchmarked to ensure it scales without memory issues.
+- What will you do next week, and what decision or help do you need?
+	- I will preregister the evaluation plan, locking in the metrics, budgets, and transformations to be used against the completed detector zoo.

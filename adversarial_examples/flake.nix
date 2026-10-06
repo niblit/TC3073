@@ -38,7 +38,8 @@
               source .venv/bin/activate
               
               # Install deps lightning fast
-              uv pip install pytest nltk spacy sentence-transformers
+              uv pip install pytest nltk spacy sentence-transformers \
+                             tensorflow tensorflow-hub gensim numpy scikit-learn
               
               # Let spacy fetch the correct model version dynamically
               python -m spacy download en_core_web_sm
@@ -46,8 +47,8 @@
               source .venv/bin/activate
             fi
 
-            # NLTK setup
-            python -c "import nltk; nltk.download('wordnet', download_dir='$NLTK_DATA', quiet=True); nltk.download('averaged_perceptron_tagger_eng', download_dir='$NLTK_DATA', quiet=True); nltk.download('stopwords', download_dir='$NLTK_DATA', quiet=True); nltk.download('punkt_tab', download_dir='$NLTK_DATA', quiet=True)"
+            # NLTK setup (wordnet no longer needed — TextFooler uses counter-fitted vectors)
+            python -c "import nltk; nltk.download('averaged_perceptron_tagger_eng', download_dir='$NLTK_DATA', quiet=True); nltk.download('stopwords', download_dir='$NLTK_DATA', quiet=True); nltk.download('punkt_tab', download_dir='$NLTK_DATA', quiet=True)"
             python --version
           '';
         };

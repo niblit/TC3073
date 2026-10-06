@@ -28,6 +28,11 @@
               pkgs.zlib
             ]}:$LD_LIBRARY_PATH"
 
+            # Expose the host NVIDIA driver (libcuda.so) on NixOS
+            if [ -d /run/opengl-driver/lib ]; then
+              export LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH"
+            fi
+
             export NLTK_DATA=$PWD/.nltk_data
             mkdir -p $NLTK_DATA
 
@@ -41,12 +46,23 @@
               uv pip install \
                 scikit-learn joblib pandas numpy \
                 nltk spacy sentence-transformers \
+                tensorflow tensorflow-hub gensim setuptools \
                 matplotlib
 
               # Let spacy fetch the correct model version dynamically
               python -m spacy download en_core_web_sm
             else
               source .venv/bin/activate
+            fi
+
+            # Expose CUDA/cuDNN libraries bundled by pip-installed nvidia-* packages
+            NVIDIA_LIBS=$(python -c '
+import glob, site
+dirs = glob.glob(site.getsitepackages()[0] + "/nvidia/*/lib")
+print(":".join(dirs))
+' 2>/dev/null)
+            if [ -n "$NVIDIA_LIBS" ]; then
+              export LD_LIBRARY_PATH="$NVIDIA_LIBS:$LD_LIBRARY_PATH"
             fi
 
             # NLTK setup

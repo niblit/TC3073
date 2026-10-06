@@ -7,6 +7,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 from src.model_pipeline import create_baseline_pipeline, BaselineDetector
+from src.base_detector import BaseDetector
 
 def test_create_baseline_pipeline_returns_detector():
     # Act

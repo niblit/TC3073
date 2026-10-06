@@ -7,4 +7,4 @@
 - What failed or remains uncertain?
 	- 
 - What will you do next week, and what decision or help do you need?
-	-
+	- 

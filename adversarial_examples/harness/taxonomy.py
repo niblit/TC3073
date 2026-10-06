@@ -82,6 +82,46 @@ class ContentTransformation(Transformation):
     """
     pass
 
+class TargetedContentTransformation(ContentTransformation):
+    """
+    Content transformation that requires black-box access to a target model.
+
+    The target_model_oracle is a callable with the signature:
+        oracle(text: str) -> Tuple[str, float]
+    It returns (predicted_label, confidence_score) for the given input text.
+
+    This is the base class for adversarial attack algorithms like TextFooler
+    (Jin et al., 2019) that require iterative model feedback.
+    """
+    def __init__(self, name: str, target_model_oracle=None):
+        super().__init__(name)
+        self._oracle = target_model_oracle
+
+    @property
+    def oracle(self):
+        return self._oracle
+
+    @oracle.setter
+    def oracle(self, value):
+        self._oracle = value
+
+    def transform(self, text: str, budget: PerturbationBudget) -> str:
+        """
+        Public API. Validates that an oracle is set, then delegates to _apply.
+        Skips verify_intent since the attack loop itself manages semantic fidelity
+        via USE similarity thresholds internally.
+        """
+        if self._oracle is None:
+            raise ValueError(
+                f"{self.name} requires a target_model_oracle. "
+                "Set it via the constructor or the .oracle property."
+            )
+        return self._apply(text, budget)
+
+    @abstractmethod
+    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+        pass
+
 class StructureTransformation(Transformation):
     """
     Transformations targeting the syntax, layout, or DOM (e.g., HTML tag injection).

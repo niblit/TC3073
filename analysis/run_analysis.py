@@ -43,11 +43,11 @@ from harness.content_attacks import DynamicSynonymSubstitution
 # Configuration
 # ---------------------------------------------------------------------------
 SEED = 42
-NUM_SAMPLES = 10
-BUDGET_STEPS = 10                       # 0.01, 0.02, ..., 1.00
+NUM_SAMPLES = 20
+BUDGET_STEPS = 50                       # 0.01, 0.02, ..., 1.00
 BUDGETS = [round(i / BUDGET_STEPS, 2) for i in range(1, BUDGET_STEPS + 1)]
 
-DATA_PATH = PROJECT_ROOT / "texts.json"
+DATA_PATH = PROJECT_ROOT / "datasets" / "texts.json"
 MODEL_PATH = PROJECT_ROOT / "detector_zoo" / "models" / "logistic_regression"
 RESULTS_DIR = Path(__file__).resolve().parent / "results"
 
@@ -101,7 +101,15 @@ def run_analysis():
 
     samples = load_malicious_samples(DATA_PATH, NUM_SAMPLES, SEED)
     detector = load_detector(MODEL_PATH)
-    attacker = DynamicSynonymSubstitution()
+
+    def oracle(text: str):
+        pred = detector.predict([text])[0]
+        probs = detector.predict_proba([text])[0]
+        label = "phishing" if pred == 1 else "benign"
+        confidence = float(probs[pred])
+        return (label, confidence)
+
+    attacker = DynamicSynonymSubstitution(target_model_oracle=oracle)
 
     # Verify all samples are actually detected as malicious (label 1)
     original_texts = [s["text"] for s in samples]

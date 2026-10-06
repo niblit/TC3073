@@ -1,14 +1,19 @@
 import joblib
+import numpy as np
 from sklearn.pipeline import Pipeline
 from sklearn.linear_model import LogisticRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-class BaselineDetector:
+from src.base_detector import BaseDetector
+
+
+class BaselineDetector(BaseDetector):
     """
-    Baseline detector wrapper providing model persistence.
+    Baseline detector using TF-IDF + Logistic Regression via a scikit-learn Pipeline.
     """
+
     def __init__(self, random_state: int = 42):
-        self.random_state = random_state
+        super().__init__(random_state)
         self.pipeline = self._create_pipeline()
 
     def _create_pipeline(self) -> Pipeline:
@@ -24,20 +29,21 @@ class BaselineDetector:
 
     def predict(self, X):
         return self.pipeline.predict(X)
-        
+
     def predict_proba(self, X):
         return self.pipeline.predict_proba(X)
 
     def save_model(self, filepath: str):
         """Saves the trained pipeline (vectorizer + model) to disk."""
         joblib.dump(self.pipeline, filepath)
-        
+
     @classmethod
     def load_model(cls, filepath: str) -> 'BaselineDetector':
         """Loads a trained pipeline from disk into a new BaselineDetector instance."""
         instance = cls()
         instance.pipeline = joblib.load(filepath)
         return instance
+
 
 def create_baseline_pipeline(random_state: int = 42):
     # Maintained for backwards compatibility in main.py
