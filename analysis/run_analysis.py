@@ -87,7 +87,10 @@ def attack_text(text: str, budget_frac: float, attacker: DynamicSynonymSubstitut
     success = True
     try:
         perturbed = attacker.transform(text, budget)
-    except Exception:
+    except Exception as e:
+        import traceback
+        print(f"\n[ATTACK ERROR]: {type(e).__name__}: {e}")
+        traceback.print_exc()
         perturbed = text
         success = False
 

@@ -16,6 +16,7 @@
           buildInputs = [
             pkgs.python312
             pkgs.uv
+            pkgs.git
             pkgs.stdenv.cc.cc.lib
             pkgs.zlib
           ];
@@ -32,21 +33,23 @@
               export LD_LIBRARY_PATH="/run/opengl-driver/lib:$LD_LIBRARY_PATH"
             fi
 
-            export NLTK_DATA=$PWD/adversarial_examples/.nltk_data
-            mkdir -p $NLTK_DATA
+            # Explicitly tie repository paths to the Git root
+            REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
+            export NLTK_DATA="$REPO_ROOT/.nltk_data"
+            mkdir -p "$NLTK_DATA"
 
-            # Create virtual environment and install dependencies
-            if [ ! -d ".venv" ]; then
+            # Create virtual environment and install dependencies at repo root
+            if [ ! -d "$REPO_ROOT/.venv" ]; then
               echo "Setting up unified virtual environment via uv..."
-              uv venv
-              source .venv/bin/activate
+              uv venv "$REPO_ROOT/.venv"
+              source "$REPO_ROOT/.venv/bin/activate"
               
-              uv pip install -r requirements.txt
+              uv pip install -r "$REPO_ROOT/requirements.txt"
               
               # Fetch SpaCy model dynamically
               python -m spacy download en_core_web_sm
             else
-              source .venv/bin/activate
+              source "$REPO_ROOT/.venv/bin/activate"
             fi
 
             # Expose CUDA/cuDNN libraries bundled by pip-installed nvidia-* packages

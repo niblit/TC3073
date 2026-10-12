@@ -17,5 +17,5 @@ gensim
 tensorflow
 tensorflow-hub
 joblib
-setuptools
+setuptools<70.0.0  # Required for tensorflow-hub (uses deprecated pkg_resources)
 matplotlib
