@@ -16,10 +16,40 @@ nix develop
 
 ## Running the Analysis
 
-Run the main analysis script:
+Run with default detector (`logistic_regression`):
 
 ```bash
 python run_analysis.py
+```
+
+### Switching Detectors:
+
+You can switch between any detector in `detector_zoo`:
+
+```bash
+# Logistic Regression (TF-IDF)
+python run_analysis.py --detector logistic_regression
+
+# Character-level CNN
+python run_analysis.py --detector char_cnn
+
+# Fine-tuned Transformer (DistilBERT)
+python run_analysis.py --detector transformer
+
+# Run sweep across all detectors sequentially:
+python run_analysis.py --detector all
+```
+
+### Additional Options:
+
+```bash
+python run_analysis.py \
+  --detector transformer \
+  --attacker textfooler \
+  --samples 10 \
+  --max-budget 0.20 \
+  --budget-steps 20 \
+  --seed 42
 ```
 
 ### What it does:
