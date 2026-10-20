@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch, call
 from collections import namedtuple
 
 from harness.budget import PerturbationBudget, BudgetExceededError
-from harness.content_attacks import TextFoolerAttack, DynamicSynonymSubstitution
+from harness.attacks.content_attacks import TextFoolerAttack
 from harness.taxonomy import TargetedContentTransformation
 
 
@@ -216,8 +216,6 @@ class TestTaxonomyIntegration:
         # Should not raise
         attack.transform("quick fox", budget)
 
-    def test_backward_compatible_alias(self):
-        assert DynamicSynonymSubstitution is TextFoolerAttack
 
 
 # ═══════════════════════════════════════════════════════════════════════════

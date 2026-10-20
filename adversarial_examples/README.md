@@ -7,7 +7,10 @@ Currently, it implements the **TextFooler** algorithm (Jin et al., 2019), a stro
 ## Architecture
 
 - `harness/taxonomy.py`: Defines the base transformations (`TargetedContentTransformation`, `StructureTransformation`, `MetadataTransformation`).
-- `harness/content_attacks.py`: Contains the `TextFoolerAttack` implementation (Word Importance Ranking, Synonym Extraction, POS & USE Filtering, Iterative Attack Loop).
+- `harness/attacks/`: Attack transformations organized by taxonomy dimension:
+  - `content_attacks.py`: Contains the `TextFoolerAttack` implementation (Word Importance Ranking, Synonym Extraction, POS & USE Filtering, Iterative Attack Loop).
+  - `structure_attack.py`: Contains structural transformations like `HTMLCommentInjection`.
+  - `metadata_attack.py`: Contains delivery metadata transformations like `TimestampSpoofing`.
 - `harness/budget.py`: Tracks and enforces the perturbation budget (`max_edits`).
 - `harness/nlp_loader.py`: Lazy-loads heavy NLP models (spaCy, Universal Sentence Encoder, Counter-fitted Word Vectors).
 - `main.py`: The CLI entry point to apply an attack to an input text using a specific target model oracle.

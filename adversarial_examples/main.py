@@ -80,7 +80,7 @@ def main():
     
     try:
         from harness.budget import PerturbationBudget
-        from harness.content_attacks import TextFoolerAttack
+        from harness.attacks import TextFoolerAttack
         
         # Compute max_edits based on the budget percentage and number of words
         word_count = len(text.split())

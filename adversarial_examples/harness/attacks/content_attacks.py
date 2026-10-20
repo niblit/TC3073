@@ -350,9 +350,3 @@ class TextFoolerAttack(TargetedContentTransformation):
                 # Continue to next word
 
         return current_text
-
-
-# ---------------------------------------------------------------------------
-# Backward-compatible alias so existing imports don't break
-# ---------------------------------------------------------------------------
-DynamicSynonymSubstitution = TextFoolerAttack

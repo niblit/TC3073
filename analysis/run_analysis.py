@@ -45,9 +45,11 @@ from src.char_cnn import CharCNNDetector
 from src.transformer_detector import TransformerDetector
 
 from harness.budget import PerturbationBudget
-from harness.content_attacks import DynamicSynonymSubstitution
-from harness.structure_attack import HTMLCommentInjection
-from harness.metadata_attack import TimestampSpoofing
+from harness.attacks import (
+    TextFoolerAttack,
+    HTMLCommentInjection,
+    TimestampSpoofing,
+)
 
 # ---------------------------------------------------------------------------
 # Registries: Detectors & Attackers
@@ -75,9 +77,9 @@ DETECTOR_REGISTRY = {
 
 ATTACKER_REGISTRY = {
     "textfooler": {
-        "factory": lambda oracle: DynamicSynonymSubstitution(target_model_oracle=oracle),
-        "display_name": "Dynamic Synonym Substitution (TextFooler)",
-        "aliases": ["synonym", "dynamic_synonym", "text_fooler"],
+        "factory": lambda oracle: TextFoolerAttack(target_model_oracle=oracle),
+        "display_name": "TextFooler",
+        "aliases": ["text_fooler"],
     },
     "html_comment": {
         "factory": lambda oracle=None: HTMLCommentInjection(),
@@ -469,7 +471,7 @@ def parse_args():
     parser.add_argument(
         "--samples", "-n",
         type=int,
-        default=10,
+        default=1,
         help="Number of malicious samples to evaluate."
     )
     parser.add_argument(
@@ -481,7 +483,7 @@ def parse_args():
     parser.add_argument(
         "--budget-steps", "-s",
         type=int,
-        default=20,
+        default=1,
         help="Number of evenly spaced budget steps from >0 up to max-budget."
     )
     parser.add_argument(
@@ -501,6 +503,11 @@ def parse_args():
         type=str,
         default=None,
         help="Custom output directory to store results."
+    )
+    parser.add_argument(
+        "--report", "--visualize",
+        action="store_true",
+        help="Automatically generate an interactive HTML report after analysis completes."
     )
     return parser.parse_args()
 
@@ -539,6 +546,19 @@ def main():
             output_dir=args.output_dir,
             timestamp=timestamp,
         )
+
+    if args.report:
+        try:
+            from visualize_results import resolve_results_directory, load_detector_run, build_html_report
+            target_dir = Path(args.output_dir) if args.output_dir else Path(__file__).resolve().parent / "results" / timestamp
+            base_dir, detector_dirs = resolve_results_directory(str(target_dir))
+            data = [load_detector_run(d) for d in detector_dirs]
+            html_content = build_html_report(f"Degradation Analysis ({timestamp})", base_dir, data)
+            report_file = base_dir / "report.html"
+            report_file.write_text(html_content, encoding="utf-8")
+            print(f"\n[REPORT] Interactive HTML report created: {report_file}")
+        except Exception as e:
+            print(f"\n[WARNING] Could not auto-generate report: {e}")
 
 
 if __name__ == "__main__":
