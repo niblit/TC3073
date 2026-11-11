@@ -766,3 +766,45 @@ class TestOracleCallCounts:
 
         # At minimum: 1 (original) + 2 (importance for quick, fox) + 1 (candidate fast)
         assert len(call_log) >= 4
+
+    def test_provided_word_ranking_skips_importance_computation_and_guides_order(self):
+        """
+        When word_ranking is passed to TextFoolerAttack.transform(), it must skip
+        _compute_word_importance and substitute words in the provided ranking order.
+        """
+        pos_map = {"quick": "ADJ", "fast": "ADJ", "brown": "ADJ", "tan": "ADJ", "fox": "NOUN"}
+        spacy = make_spacy_model(pos_map)
+        cf = make_counter_fitted_vectors({
+            "quick": [("fast", 0.85)],
+            "brown": [("tan", 0.78)],
+        })
+        use = make_use_model()
+
+        call_log = []
+
+        def oracle(text):
+            call_log.append(text)
+            if "tan" in text:
+                return ("benign", 0.85)  # flip when "brown" -> "tan"
+            return ("phishing", 0.95)
+
+        attack = TextFoolerAttack(
+            target_model_oracle=oracle,
+            counter_fitted_vectors=cf,
+            use_model=use,
+            spacy_model=spacy,
+        )
+
+        # Provide ranking that prioritizes index 1 ("brown") before index 0 ("quick")
+        precomputed_ranking = [(1, 0.90), (0, 0.20), (2, float("-inf"))]
+        budget = PerturbationBudget(max_edits=1)
+
+        with patch.object(attack, "_compute_word_importance", wraps=attack._compute_word_importance) as spy_imp:
+            result = attack.transform("quick brown fox", budget, word_ranking=precomputed_ranking)
+            assert spy_imp.call_count == 0
+
+        # Because index 1 ("brown") was ranked first, it was replaced with "tan" and flipped the label,
+        # leaving "quick" untouched and making only 2 oracle calls (original + "quick tan fox").
+        assert result == "quick tan fox"
+        assert budget.consumed == 1
+        assert len(call_log) == 2

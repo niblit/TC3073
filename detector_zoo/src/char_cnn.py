@@ -223,7 +223,8 @@ class CharCNNDetector(BaseDetector):
         dataset = _TextDataset(X_enc)
         loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=False)
 
-        self.model.eval()
+        if self.model.training:
+            self.model.eval()
         all_probs = []
         with torch.no_grad():
             for batch_X in loader:
@@ -273,4 +274,5 @@ class CharCNNDetector(BaseDetector):
             weights_only=True,
         )
         instance.model.load_state_dict(state)
+        instance.model.eval()
         return instance

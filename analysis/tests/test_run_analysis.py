@@ -7,7 +7,7 @@ from unittest.mock import patch, MagicMock
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from run_analysis import parse_args, run_single_analysis
+from run_analysis import parse_args, run_single_analysis, WorkPool, attack_text
 
 
 def test_parse_args_skip_flipped_flags():
@@ -304,3 +304,217 @@ def test_skip_flipped_all_flipped_at_step_one(tmp_path):
         for mr in metrics_rows:
             assert float(mr["detection_rate"]) == 0.0
             assert float(mr["evasion_rate"]) == 1.0
+
+
+def test_parse_args_parallel_and_word_ranking_flags():
+    """Verify CLI argument parsing for --parallel, --workers, and --word-ranking toggles."""
+    with patch("sys.argv", ["run_analysis.py"]):
+        args = parse_args()
+        assert args.parallel is False
+        assert args.workers is None
+        assert args.word_ranking is False
+
+    with patch("sys.argv", ["run_analysis.py", "--parallel", "--workers", "6"]):
+        args = parse_args()
+        assert args.parallel is True
+        assert args.workers == 6
+
+    with patch("sys.argv", ["run_analysis.py", "--work-pool", "-w", "4"]):
+        args = parse_args()
+        assert args.parallel is True
+        assert args.workers == 4
+
+    with patch("sys.argv", ["run_analysis.py", "--no-parallel"]):
+        args = parse_args()
+        assert args.parallel is False
+
+    with patch("sys.argv", ["run_analysis.py", "--word-ranking"]):
+        args = parse_args()
+        assert args.word_ranking is True
+
+    with patch("sys.argv", ["run_analysis.py", "--precompute-word-ranking"]):
+        args = parse_args()
+        assert args.word_ranking is True
+
+    with patch("sys.argv", ["run_analysis.py", "--shared-word-ranking"]):
+        args = parse_args()
+        assert args.word_ranking is True
+
+    with patch("sys.argv", ["run_analysis.py", "--no-word-ranking"]):
+        args = parse_args()
+        assert args.word_ranking is False
+
+
+def test_work_pool_preserves_order_and_executes_concurrently():
+    """Verify WorkPool executes tasks across workers and returns results in exact input order."""
+    import time
+
+    def slow_for_even(x: int) -> int:
+        if x % 2 == 0:
+            time.sleep(0.02)
+        return x * 10
+
+    items = list(range(8))
+    with WorkPool(max_workers=4) as pool:
+        results = pool.map(slow_for_even, items)
+
+    assert results == [x * 10 for x in items]
+    assert WorkPool(max_workers=2).map(lambda x: x, []) == []
+
+
+def test_parallel_work_pool_execution_in_analysis(tmp_path):
+    """
+    Verify that when parallel=True is enabled in run_single_analysis, tasks are
+    drawn from the work pool, results match sequential ordering, and run_config.json
+    records parallel=True and num_workers.
+    """
+    data_file = tmp_path / "texts.json"
+    data_file.write_text(json.dumps([
+        {"text": "Sample zero phishing lure", "label": 1},
+        {"text": "Sample one suspicious message", "label": 1},
+        {"text": "Sample two urgent verification", "label": 1},
+    ]))
+
+    output_dir = tmp_path / "run_parallel"
+    attack_calls = []
+
+    def mock_attack_text(text, budget_frac, attacker, word_ranking=None):
+        attack_calls.append((text, budget_frac, word_ranking))
+        return f"perturbed: {text}", 1, True
+
+    mock_detector = MagicMock()
+    mock_detector.predict.side_effect = lambda texts: [1] * len(texts)
+    mock_detector.predict_proba.side_effect = lambda texts: [[0.2, 0.8]] * len(texts)
+
+    with patch("run_analysis.load_detector") as mock_load_det, \
+         patch("run_analysis.attack_text", side_effect=mock_attack_text):
+
+        mock_load_det.return_value = (
+            mock_detector,
+            "mock_det",
+            {"display_name": "Mock Detector"},
+            Path("/mock/model"),
+        )
+
+        res_dir = run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="zero_width",
+            num_samples=3,
+            max_budget=0.20,
+            budget_steps=2,
+            seed=42,
+            data_path=data_file,
+            output_dir=output_dir,
+            parallel=True,
+            num_workers=3,
+        )
+
+        assert res_dir is not None
+        assert len(attack_calls) == 6  # 3 samples * 2 steps
+
+        cfg_file = output_dir / "run_config.json"
+        with open(cfg_file, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        assert cfg["parallel"] is True
+        assert cfg["num_workers"] == 3
+        assert cfg["word_ranking"] is False
+
+        raw_csv = output_dir / "raw_results.csv"
+        with open(raw_csv, "r", encoding="utf-8") as f:
+            rows = list(csv.DictReader(f))
+        assert len(rows) == 6
+        # Verify sample indices in CSV are ordered 0, 1, 2 for each budget step
+        assert [int(r["sample_idx"]) for r in rows] == [0, 1, 2, 0, 1, 2]
+
+
+def test_word_ranking_precomputed_once_and_shared_across_steps_and_attackers(tmp_path):
+    """
+    Verify that when word_ranking=True:
+    1. compute_word_ranking is called once per sample (not repeated on every budget step).
+    2. The computed ranking is passed to attack_text / attacker.transform on every step.
+    3. When shared_word_rankings dict is passed to a second attacker run on the same detector,
+       compute_word_ranking is NOT called again (0 extra ranking computations).
+    """
+    data_file = tmp_path / "texts.json"
+    data_file.write_text(json.dumps([
+        {"text": "Please verify account password immediately", "label": 1},
+        {"text": "Urgent action required for login credentials", "label": 1},
+    ]))
+
+    received_rankings = []
+
+    def mock_attack_text(text, budget_frac, attacker, word_ranking=None):
+        received_rankings.append((text, budget_frac, word_ranking))
+        return f"perturbed: {text}", 1, True
+
+    fake_ranking_fn = MagicMock(side_effect=lambda text, oracle: [(3, 0.85), (1, 0.45)])
+
+    mock_detector = MagicMock()
+    mock_detector.predict.side_effect = lambda texts: [1] * len(texts)
+    mock_detector.predict_proba.side_effect = lambda texts: [[0.1, 0.9]] * len(texts)
+
+    shared_rankings = {}
+
+    with patch("run_analysis.load_detector") as mock_load_det, \
+         patch("run_analysis.attack_text", side_effect=mock_attack_text), \
+         patch("run_analysis.compute_word_ranking", side_effect=fake_ranking_fn):
+
+        mock_load_det.return_value = (
+            mock_detector,
+            "mock_det",
+            {"display_name": "Mock Detector"},
+            Path("/mock/model"),
+        )
+
+        # Run 1: Zero-Width attack with 3 budget steps
+        out_dir_1 = tmp_path / "run_att_1"
+        run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="zero_width",
+            num_samples=2,
+            max_budget=0.30,
+            budget_steps=3,
+            seed=42,
+            data_path=data_file,
+            output_dir=out_dir_1,
+            parallel=True,
+            num_workers=2,
+            word_ranking=True,
+            word_rankings=shared_rankings,
+        )
+
+        # Ranking was computed ONLY once per sample (2 samples total), despite 3 budget steps!
+        assert fake_ranking_fn.call_count == 2
+        assert len(shared_rankings) == 2
+
+        # All 6 attack calls (2 samples * 3 steps) received the precomputed word_ranking!
+        assert len(received_rankings) == 6
+        for _text, _b, rank in received_rankings:
+            assert rank == [(3, 0.85), (1, 0.45)]
+
+        # Run 2: Homoglyph attack sharing `shared_rankings`
+        out_dir_2 = tmp_path / "run_att_2"
+        run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="homoglyph",
+            num_samples=2,
+            max_budget=0.30,
+            budget_steps=3,
+            seed=42,
+            data_path=data_file,
+            output_dir=out_dir_2,
+            parallel=True,
+            num_workers=2,
+            word_ranking=True,
+            word_rankings=shared_rankings,
+        )
+
+        # Zero additional calls to compute_word_ranking on the 2nd attacker!
+        assert fake_ranking_fn.call_count == 2
+        assert len(received_rankings) == 12
+
+        cfg_file = out_dir_2 / "run_config.json"
+        with open(cfg_file, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        assert cfg["word_ranking"] is True
+        assert cfg["parallel"] is True

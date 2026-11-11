@@ -18,6 +18,7 @@ from harness.attacks import (
     HTMLEntityEncodingAttack,
     DOMWrapperAttack,
     HomoglyphSubstitutionAttack,
+    compute_word_ranking,
 )
 from harness.attacks.content_attacks import (
     TextFoolerAttack as ContentTextFoolerAttack,
@@ -70,6 +71,7 @@ def test_attacks_module_exports():
         "HTMLEntityEncodingAttack",
         "DOMWrapperAttack",
         "HomoglyphSubstitutionAttack",
+        "compute_word_ranking",
     ]
     for export_name in expected_exports:
         assert export_name in harness.attacks.__all__

@@ -161,8 +161,14 @@ class TransformerDetector(BaseDetector):
         encodings = self._tokenize(X)
         dataset = _HFDataset(encodings)
 
-        self.model.eval()
-        self.model.to(self.device)
+        if self.model.training:
+            self.model.eval()
+        try:
+            param_device = next(self.model.parameters()).device
+        except StopIteration:
+            param_device = None
+        if param_device != self.device:
+            self.model.to(self.device)
 
         all_probs = []
         loader = torch.utils.data.DataLoader(dataset, batch_size=self.batch_size)
@@ -219,4 +225,5 @@ class TransformerDetector(BaseDetector):
         instance.tokenizer = AutoTokenizer.from_pretrained(filepath)
         instance.model = AutoModelForSequenceClassification.from_pretrained(filepath)
         instance.model.to(instance.device)
+        instance.model.eval()
         return instance

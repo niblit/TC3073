@@ -13,9 +13,32 @@ via black-box oracles to evade phishing, BEC, and email classifiers:
 import re
 import random
 import string
-from typing import List, Optional, Tuple, Callable
+from typing import List, Optional, Sequence, Tuple, Callable, Union
 from harness.taxonomy import StructureTransformation, TargetedStructureTransformation
 from harness.budget import PerturbationBudget
+
+
+def _normalize_word_ranking(
+    word_ranking: Sequence[Union[Tuple[int, float], int]],
+    num_words: int,
+) -> List[Tuple[int, float]]:
+    """
+    Normalize a provided word ranking into a list of (word_idx, importance_score)
+    tuples sorted descending by importance score.
+    Supports either (word_idx, score) tuples or plain integer word indices.
+    """
+    normalized: List[Tuple[int, float]] = []
+    for item in word_ranking:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            idx, score = int(item[0]), float(item[1])
+        elif isinstance(item, int):
+            idx, score = int(item), 1.0
+        else:
+            continue
+        if 0 <= idx < num_words:
+            normalized.append((idx, score))
+    normalized.sort(key=lambda x: x[1], reverse=True)
+    return normalized
 
 
 class HTMLCommentInjection(StructureTransformation):
@@ -27,7 +50,12 @@ class HTMLCommentInjection(StructureTransformation):
         super().__init__(name)
         self.num_injections = num_injections
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(
+        self,
+        text: str,
+        budget: PerturbationBudget,
+        word_ranking: Optional[Sequence[Union[Tuple[int, float], int]]] = None,
+    ) -> str:
         cost = self.num_injections
         budget.consume(cost)
 
@@ -45,7 +73,7 @@ class HTMLCommentInjection(StructureTransformation):
 
 
 # ---------------------------------------------------------------------------
-# Helpers for Structure Attacks
+# Helpers for Structure Attacks & Word Ranking
 # ---------------------------------------------------------------------------
 
 DEFAULT_STOP_WORDS = {
@@ -82,7 +110,7 @@ def _compute_word_importance(
     headers: str = "",
     sep: str = "",
     stop_words: Optional[set] = None,
-    max_words_to_evaluate: int = 50,
+    max_words_to_evaluate: Optional[int] = 50,
 ) -> List[Tuple[int, float]]:
     """
     Ranks words by importance score I(w_i) = original_conf - conf(x \\ w_i).
@@ -98,7 +126,7 @@ def _compute_word_importance(
             importance_scores.append((idx, float("-inf")))
             continue
 
-        if evaluated_count >= max_words_to_evaluate:
+        if max_words_to_evaluate is not None and evaluated_count >= max_words_to_evaluate:
             importance_scores.append((idx, float("-inf")))
             continue
 
@@ -118,6 +146,36 @@ def _compute_word_importance(
 
     importance_scores.sort(key=lambda x: x[1], reverse=True)
     return importance_scores
+
+
+def compute_word_ranking(
+    text: str,
+    oracle: Callable[[str], Tuple[str, float]],
+    stop_words: Optional[set] = None,
+    max_words_to_evaluate: Optional[int] = 50,
+) -> List[Tuple[int, float]]:
+    """
+    Precomputes the word importance ranking for `text` by removing one word at a
+    time and querying `oracle` to measure the confidence impact.
+    Returns a list of (word_idx, importance_score) tuples sorted descending by score.
+    """
+    if not text or not text.strip():
+        return []
+    headers, body, sep = _separate_headers_body(text)
+    words = body.split()
+    if not words:
+        return []
+    original_label, original_conf = oracle(text)
+    return _compute_word_importance(
+        oracle=oracle,
+        words=words,
+        original_label=original_label,
+        original_conf=original_conf,
+        headers=headers,
+        sep=sep,
+        stop_words=stop_words,
+        max_words_to_evaluate=max_words_to_evaluate,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +204,12 @@ class ZeroWidthInjectionAttack(TargetedStructureTransformation):
         super().__init__(name, target_model_oracle)
         self.zero_width_chars = zero_width_chars or list(DEFAULT_ZERO_WIDTH_CHARS)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(
+        self,
+        text: str,
+        budget: PerturbationBudget,
+        word_ranking: Optional[Sequence[Union[Tuple[int, float], int]]] = None,
+    ) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -163,9 +226,12 @@ class ZeroWidthInjectionAttack(TargetedStructureTransformation):
         current_words = list(words)
         current_conf = original_conf
 
-        importance_ranking = _compute_word_importance(
-            oracle, current_words, original_label, original_conf, headers, sep
-        )
+        if word_ranking is not None:
+            importance_ranking = _normalize_word_ranking(word_ranking, len(current_words))
+        else:
+            importance_ranking = _compute_word_importance(
+                oracle, current_words, original_label, original_conf, headers, sep
+            )
 
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:
@@ -244,7 +310,12 @@ class HTMLTagInjectionAttack(TargetedStructureTransformation):
         super().__init__(name, target_model_oracle)
         self.tags = tags or list(DEFAULT_INLINE_TAGS)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(
+        self,
+        text: str,
+        budget: PerturbationBudget,
+        word_ranking: Optional[Sequence[Union[Tuple[int, float], int]]] = None,
+    ) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -261,9 +332,12 @@ class HTMLTagInjectionAttack(TargetedStructureTransformation):
         current_words = list(words)
         current_conf = original_conf
 
-        importance_ranking = _compute_word_importance(
-            oracle, current_words, original_label, original_conf, headers, sep
-        )
+        if word_ranking is not None:
+            importance_ranking = _normalize_word_ranking(word_ranking, len(current_words))
+        else:
+            importance_ranking = _compute_word_importance(
+                oracle, current_words, original_label, original_conf, headers, sep
+            )
 
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:
@@ -341,7 +415,12 @@ class HTMLEntityEncodingAttack(TargetedStructureTransformation):
         super().__init__(name, target_model_oracle)
         self.entity_map = entity_map or dict(DEFAULT_ENTITY_MAP)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(
+        self,
+        text: str,
+        budget: PerturbationBudget,
+        word_ranking: Optional[Sequence[Union[Tuple[int, float], int]]] = None,
+    ) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -358,9 +437,12 @@ class HTMLEntityEncodingAttack(TargetedStructureTransformation):
         current_words = list(words)
         current_conf = original_conf
 
-        importance_ranking = _compute_word_importance(
-            oracle, current_words, original_label, original_conf, headers, sep
-        )
+        if word_ranking is not None:
+            importance_ranking = _normalize_word_ranking(word_ranking, len(current_words))
+        else:
+            importance_ranking = _compute_word_importance(
+                oracle, current_words, original_label, original_conf, headers, sep
+            )
 
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:
@@ -435,7 +517,12 @@ class DOMWrapperAttack(TargetedStructureTransformation):
         super().__init__(name, target_model_oracle)
         self.wrapper_templates = wrapper_templates or list(DEFAULT_DOM_TEMPLATES)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(
+        self,
+        text: str,
+        budget: PerturbationBudget,
+        word_ranking: Optional[Sequence[Union[Tuple[int, float], int]]] = None,
+    ) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -517,7 +604,12 @@ class HomoglyphSubstitutionAttack(TargetedStructureTransformation):
         super().__init__(name, target_model_oracle)
         self.homoglyph_map = homoglyph_map or dict(DEFAULT_HOMOGLYPH_MAP)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(
+        self,
+        text: str,
+        budget: PerturbationBudget,
+        word_ranking: Optional[Sequence[Union[Tuple[int, float], int]]] = None,
+    ) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -534,9 +626,12 @@ class HomoglyphSubstitutionAttack(TargetedStructureTransformation):
         current_words = list(words)
         current_conf = original_conf
 
-        importance_ranking = _compute_word_importance(
-            oracle, current_words, original_label, original_conf, headers, sep
-        )
+        if word_ranking is not None:
+            importance_ranking = _normalize_word_ranking(word_ranking, len(current_words))
+        else:
+            importance_ranking = _compute_word_importance(
+                oracle, current_words, original_label, original_conf, headers, sep
+            )
 
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:

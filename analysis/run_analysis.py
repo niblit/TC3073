@@ -19,7 +19,9 @@ import argparse
 import warnings
 import logging
 import base64
+import inspect
 import statistics
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 
@@ -55,6 +57,7 @@ from harness.attacks import (
     HTMLEntityEncodingAttack,
     DOMWrapperAttack,
     HomoglyphSubstitutionAttack,
+    compute_word_ranking,
     # Metadata
     TimestampSpoofing,
     SenderHeaderAttack,
@@ -297,14 +300,82 @@ def create_oracle(detector):
     return oracle
 
 
-def attack_text(text: str, budget_frac: float, attacker) -> tuple[str, int, bool]:
+class WorkPool:
+    """
+    A configurable worker pool for executing adversarial attack and word-ranking
+    tasks in parallel. Designed to scale across high-RAM / GPU VMs while remaining
+    an explicit toggle (disabled by default for lightweight laptop runs).
+    """
+
+    def __init__(self, max_workers: int | None = None):
+        if max_workers is None or max_workers <= 0:
+            cpu_count = os.cpu_count() or 4
+            max_workers = min(cpu_count, 8)
+        self.max_workers = max_workers
+        self._executor: ThreadPoolExecutor | None = None
+
+    def __enter__(self):
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.shutdown()
+
+    def shutdown(self):
+        if self._executor is not None:
+            self._executor.shutdown(wait=True)
+            self._executor = None
+
+    def map(self, fn, items: list):
+        """
+        Submits all items to the work pool and returns results in the exact order
+        of `items`. Workers dynamically draw tasks from the pool queue as they
+        complete previous work.
+        """
+        if not items:
+            return []
+        own_executor = False
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=self.max_workers)
+            own_executor = True
+        try:
+            futures = {
+                self._executor.submit(fn, item): idx
+                for idx, item in enumerate(items)
+            }
+            results = [None] * len(items)
+            for future in as_completed(futures):
+                idx = futures[future]
+                results[idx] = future.result()
+            return results
+        finally:
+            if own_executor:
+                self.shutdown()
+
+
+def attack_text(
+    text: str,
+    budget_frac: float,
+    attacker,
+    word_ranking: list[tuple[int, float]] | None = None,
+) -> tuple[str, int, bool]:
     word_count = len(text.split())
     max_edits = max(1, int(word_count * budget_frac)) if budget_frac > 0 else 0
     budget = PerturbationBudget(max_edits=max_edits)
 
     success = True
     try:
-        perturbed = attacker.transform(text, budget)
+        if word_ranking is not None:
+            sig = inspect.signature(attacker.transform)
+            if "word_ranking" in sig.parameters or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+            ):
+                perturbed = attacker.transform(text, budget, word_ranking=word_ranking)
+            else:
+                perturbed = attacker.transform(text, budget)
+        else:
+            perturbed = attacker.transform(text, budget)
     except Exception as e:
         import traceback
         print(f"\n[ATTACK ERROR]: {type(e).__name__}: {e}")
@@ -329,6 +400,20 @@ def attack_text(text: str, budget_frac: float, attacker) -> tuple[str, int, bool
     return perturbed, consumed, success
 
 
+def _invoke_attack_text(text: str, budget_frac: float, attacker, sample_ranking=None):
+    """
+    Helper to call `attack_text`, forwarding `word_ranking` only when non-None
+    and accepted by `attack_text` (preserving compatibility with 3-arg test mocks).
+    """
+    if sample_ranking is not None:
+        sig = inspect.signature(attack_text)
+        if "word_ranking" in sig.parameters or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        ):
+            return attack_text(text, budget_frac, attacker, word_ranking=sample_ranking)
+    return attack_text(text, budget_frac, attacker)
+
+
 # ---------------------------------------------------------------------------
 # Core Analysis Pipeline
 # ---------------------------------------------------------------------------
@@ -344,6 +429,11 @@ def run_single_analysis(
     output_dir: Path | str | None = None,
     timestamp: str | None = None,
     skip_flipped: bool = False,
+    parallel: bool = False,
+    num_workers: int | None = None,
+    work_pool: WorkPool | None = None,
+    word_ranking: bool = False,
+    word_rankings: dict[int, list[tuple[int, float]]] | list[list[tuple[int, float]]] | None = None,
 ):
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -387,6 +477,47 @@ def run_single_analysis(
 
     orig_confidences = [prob[1] for prob in original_probas]
 
+    # Set up optional work pool
+    own_pool = False
+    active_pool: WorkPool | None = None
+    if parallel:
+        if work_pool is not None:
+            active_pool = work_pool
+        else:
+            active_pool = WorkPool(max_workers=num_workers)
+            active_pool.__enter__()
+            own_pool = True
+
+    effective_workers = active_pool.max_workers if active_pool is not None else 1
+
+    # Set up optional precomputed word rankings
+    use_word_ranking = bool(word_ranking or word_rankings is not None)
+    sample_word_rankings: dict[int, list[tuple[int, float]]] | None = None
+
+    if use_word_ranking:
+        if isinstance(word_rankings, list):
+            sample_word_rankings = {i: list(r) for i, r in enumerate(word_rankings)}
+        elif isinstance(word_rankings, dict):
+            sample_word_rankings = word_rankings
+        else:
+            sample_word_rankings = {}
+
+        missing_indices = [i for i in range(num_valid) if i not in sample_word_rankings]
+        if missing_indices:
+            print(f"  Precomputing word rankings for {len(missing_indices)} sample(s) ...")
+            if active_pool is not None:
+                computed = active_pool.map(
+                    lambda idx: (idx, compute_word_ranking(original_texts[idx], oracle)),
+                    missing_indices,
+                )
+                for idx, rank in computed:
+                    sample_word_rankings[idx] = rank
+            else:
+                for idx in missing_indices:
+                    sample_word_rankings[idx] = compute_word_ranking(original_texts[idx], oracle)
+        else:
+            print(f"  Using precomputed word rankings for {num_valid} sample(s).")
+
     # ------------------------------------------------------------------
     # CSV Configuration
     # ------------------------------------------------------------------
@@ -419,140 +550,159 @@ def run_single_analysis(
     total_steps = len(budgets)
     print(f"\nTarget Detector : {det_spec['display_name']} ({resolved_model_path.name})")
     print(f"Attacker        : {att_spec['display_name']}")
+    print(f"Parallel Pool   : {'Enabled (' + str(effective_workers) + ' workers)' if parallel else 'Disabled (Sequential)'}")
+    print(f"Word Ranking    : {'Precomputed / Shared' if use_word_ranking else 'Per-attack Default'}")
     print(f"Saving results to: {results_dir}")
     print(f"Running {total_steps} budget levels × {num_valid} samples = {total_steps * num_valid} attack runs ...\n")
 
     # Track samples that have already flipped detection (pred != 1)
     flipped_samples = {}  # sample_idx -> dict of cached results
 
-    for step_idx, budget_frac in enumerate(budgets):
-        pct = int(budget_frac * 100)
+    try:
+        for step_idx, budget_frac in enumerate(budgets):
+            pct = int(budget_frac * 100)
 
-        # Determine which samples need attacking in this budget step
-        if skip_flipped:
-            active_indices = [i for i in range(num_valid) if i not in flipped_samples]
-            skipped_count = num_valid - len(active_indices)
-        else:
-            active_indices = list(range(num_valid))
-            skipped_count = 0
-
-        status_prefix = f"  [{step_idx + 1:3d}/{total_steps}] Budget = {pct:3d}%"
-        if skip_flipped and skipped_count > 0:
-            print(f"{status_prefix} (active: {len(active_indices)}/{num_valid}, skipped: {skipped_count}) ...", end="", flush=True)
-        else:
-            print(f"{status_prefix} ...", end="", flush=True)
-
-        active_perturbed = {}
-        active_consumed = {}
-        active_success = {}
-
-        for i in active_indices:
-            text = original_texts[i]
-            pert, cons, succ = attack_text(text, budget_frac, attacker)
-            active_perturbed[i] = pert
-            active_consumed[i] = cons
-            active_success[i] = succ
-
-        if active_indices:
-            active_texts = [active_perturbed[i] for i in active_indices]
-            active_preds = detector.predict(active_texts)
-            active_probas = detector.predict_proba(active_texts)
-            active_confidences = [prob[1] for prob in active_probas]
-        else:
-            active_preds = []
-            active_confidences = []
-
-        # Build full result lists for all samples in this step
-        step_perturbed_texts = []
-        step_consumed_budgets = []
-        step_success_flags = []
-        step_pert_preds = []
-        step_pert_confidences = []
-
-        active_pos = 0
-        for i in range(num_valid):
-            if skip_flipped and i in flipped_samples:
-                prev = flipped_samples[i]
-                step_perturbed_texts.append(prev["perturbed_text"])
-                step_consumed_budgets.append(prev["consumed_budget"])
-                step_success_flags.append(prev["success"])
-                step_pert_preds.append(prev["perturbed_pred"])
-                step_pert_confidences.append(prev["perturbed_confidence"])
+            # Determine which samples need attacking in this budget step
+            if skip_flipped:
+                active_indices = [i for i in range(num_valid) if i not in flipped_samples]
+                skipped_count = num_valid - len(active_indices)
             else:
-                p_text = active_perturbed[i]
-                p_cons = active_consumed[i]
-                p_succ = active_success[i]
-                p_pred = int(active_preds[active_pos])
-                p_conf = float(active_confidences[active_pos])
-                active_pos += 1
+                active_indices = list(range(num_valid))
+                skipped_count = 0
 
-                step_perturbed_texts.append(p_text)
-                step_consumed_budgets.append(p_cons)
-                step_success_flags.append(p_succ)
-                step_pert_preds.append(p_pred)
-                step_pert_confidences.append(p_conf)
+            status_prefix = f"  [{step_idx + 1:3d}/{total_steps}] Budget = {pct:3d}%"
+            if skip_flipped and skipped_count > 0:
+                print(f"{status_prefix} (active: {len(active_indices)}/{num_valid}, skipped: {skipped_count}) ...", end="", flush=True)
+            else:
+                print(f"{status_prefix} ...", end="", flush=True)
 
-                if skip_flipped and p_pred != 1:
-                    flipped_samples[i] = {
-                        "perturbed_text": p_text,
-                        "consumed_budget": p_cons,
-                        "success": p_succ,
-                        "perturbed_pred": p_pred,
-                        "perturbed_confidence": p_conf,
-                    }
+            active_perturbed = {}
+            active_consumed = {}
+            active_success = {}
 
-        evasions = 0
-        for i in range(num_valid):
-            evaded = int(step_pert_preds[i] != 1)
-            evasions += evaded
+            if active_pool is not None and active_indices:
+                def _run_sample_attack(sample_idx: int):
+                    text = original_texts[sample_idx]
+                    s_rank = sample_word_rankings.get(sample_idx) if sample_word_rankings is not None else None
+                    pert, cons, succ = _invoke_attack_text(text, budget_frac, attacker, s_rank)
+                    return sample_idx, pert, cons, succ
 
-            orig_b64 = base64.b64encode(original_texts[i].encode("utf-8")).decode("utf-8")
-            pert_b64 = base64.b64encode(step_perturbed_texts[i].encode("utf-8")).decode("utf-8")
+                pool_results = active_pool.map(_run_sample_attack, active_indices)
+                for i, pert, cons, succ in pool_results:
+                    active_perturbed[i] = pert
+                    active_consumed[i] = cons
+                    active_success[i] = succ
+            else:
+                for i in active_indices:
+                    text = original_texts[i]
+                    s_rank = sample_word_rankings.get(i) if sample_word_rankings is not None else None
+                    pert, cons, succ = _invoke_attack_text(text, budget_frac, attacker, s_rank)
+                    active_perturbed[i] = pert
+                    active_consumed[i] = cons
+                    active_success[i] = succ
 
-            raw_writer.writerow({
+            if active_indices:
+                active_texts = [active_perturbed[i] for i in active_indices]
+                active_preds = detector.predict(active_texts)
+                active_probas = detector.predict_proba(active_texts)
+                active_confidences = [prob[1] for prob in active_probas]
+            else:
+                active_preds = []
+                active_confidences = []
+
+            # Build full result lists for all samples in this step
+            step_perturbed_texts = []
+            step_consumed_budgets = []
+            step_success_flags = []
+            step_pert_preds = []
+            step_pert_confidences = []
+
+            active_pos = 0
+            for i in range(num_valid):
+                if skip_flipped and i in flipped_samples:
+                    prev = flipped_samples[i]
+                    step_perturbed_texts.append(prev["perturbed_text"])
+                    step_consumed_budgets.append(prev["consumed_budget"])
+                    step_success_flags.append(prev["success"])
+                    step_pert_preds.append(prev["perturbed_pred"])
+                    step_pert_confidences.append(prev["perturbed_confidence"])
+                else:
+                    p_text = active_perturbed[i]
+                    p_cons = active_consumed[i]
+                    p_succ = active_success[i]
+                    p_pred = int(active_preds[active_pos])
+                    p_conf = float(active_confidences[active_pos])
+                    active_pos += 1
+
+                    step_perturbed_texts.append(p_text)
+                    step_consumed_budgets.append(p_cons)
+                    step_success_flags.append(p_succ)
+                    step_pert_preds.append(p_pred)
+                    step_pert_confidences.append(p_conf)
+
+                    if skip_flipped and p_pred != 1:
+                        flipped_samples[i] = {
+                            "perturbed_text": p_text,
+                            "consumed_budget": p_cons,
+                            "success": p_succ,
+                            "perturbed_pred": p_pred,
+                            "perturbed_confidence": p_conf,
+                        }
+
+            evasions = 0
+            for i in range(num_valid):
+                evaded = int(step_pert_preds[i] != 1)
+                evasions += evaded
+
+                orig_b64 = base64.b64encode(original_texts[i].encode("utf-8")).decode("utf-8")
+                pert_b64 = base64.b64encode(step_perturbed_texts[i].encode("utf-8")).decode("utf-8")
+
+                raw_writer.writerow({
+                    "budget": budget_frac,
+                    "sample_idx": i,
+                    "original_pred": 1,
+                    "perturbed_pred": int(step_pert_preds[i]),
+                    "original_confidence": round(orig_confidences[i], 6),
+                    "perturbed_confidence": round(step_pert_confidences[i], 6),
+                    "evaded": evaded,
+                    "real_budget_consumed": step_consumed_budgets[i],
+                    "transformation_success": step_success_flags[i],
+                    "original_text_b64": orig_b64,
+                    "perturbed_text_b64": pert_b64
+                })
+
+            evasion_rate = evasions / num_valid
+            detection_rate = 1.0 - evasion_rate
+
+            se_det = (detection_rate * (1.0 - detection_rate) / num_valid) ** 0.5 if num_valid > 0 else 0.0
+
+            mean_orig_conf = sum(orig_confidences) / num_valid
+            mean_pert_conf = sum(step_pert_confidences) / num_valid
+            std_pert_conf = statistics.stdev(step_pert_confidences) if num_valid > 1 else 0.0
+            mean_drop = mean_orig_conf - mean_pert_conf
+
+            mean_consumed = sum(step_consumed_budgets) / num_valid
+            failed_count = sum(1 for s in step_success_flags if not s)
+
+            aggregated_rows.append({
                 "budget": budget_frac,
-                "sample_idx": i,
-                "original_pred": 1,
-                "perturbed_pred": int(step_pert_preds[i]),
-                "original_confidence": round(orig_confidences[i], 6),
-                "perturbed_confidence": round(step_pert_confidences[i], 6),
-                "evaded": evaded,
-                "real_budget_consumed": step_consumed_budgets[i],
-                "transformation_success": step_success_flags[i],
-                "original_text_b64": orig_b64,
-                "perturbed_text_b64": pert_b64
+                "detection_rate": round(detection_rate, 4),
+                "se_detection_rate": round(se_det, 4),
+                "evasion_rate": round(evasion_rate, 4),
+                "mean_orig_confidence": round(mean_orig_conf, 6),
+                "mean_pert_confidence": round(mean_pert_conf, 6),
+                "std_pert_confidence": round(std_pert_conf, 6),
+                "mean_confidence_drop": round(mean_drop, 6),
+                "mean_real_budget_consumed": round(mean_consumed, 2),
+                "failed_transformations": failed_count
             })
 
-        evasion_rate = evasions / num_valid
-        detection_rate = 1.0 - evasion_rate
-
-        se_det = (detection_rate * (1.0 - detection_rate) / num_valid) ** 0.5 if num_valid > 0 else 0.0
-
-        mean_orig_conf = sum(orig_confidences) / num_valid
-        mean_pert_conf = sum(step_pert_confidences) / num_valid
-        std_pert_conf = statistics.stdev(step_pert_confidences) if num_valid > 1 else 0.0
-        mean_drop = mean_orig_conf - mean_pert_conf
-
-        mean_consumed = sum(step_consumed_budgets) / num_valid
-        failed_count = sum(1 for s in step_success_flags if not s)
-
-        aggregated_rows.append({
-            "budget": budget_frac,
-            "detection_rate": round(detection_rate, 4),
-            "se_detection_rate": round(se_det, 4),
-            "evasion_rate": round(evasion_rate, 4),
-            "mean_orig_confidence": round(mean_orig_conf, 6),
-            "mean_pert_confidence": round(mean_pert_conf, 6),
-            "std_pert_confidence": round(std_pert_conf, 6),
-            "mean_confidence_drop": round(mean_drop, 6),
-            "mean_real_budget_consumed": round(mean_consumed, 2),
-            "failed_transformations": failed_count
-        })
-
-        skip_info = f"  skipped={skipped_count}" if skip_flipped else ""
-        print(f"  det={detection_rate:.2%}  Δconf={mean_drop:+.4f}  failures={failed_count}{skip_info}")
-
-    raw_file.close()
+            skip_info = f"  skipped={skipped_count}" if skip_flipped else ""
+            print(f"  det={detection_rate:.2%}  Δconf={mean_drop:+.4f}  failures={failed_count}{skip_info}")
+    finally:
+        raw_file.close()
+        if own_pool and active_pool is not None:
+            active_pool.shutdown()
 
     # ------------------------------------------------------------------
     # Metrics CSV Output
@@ -578,6 +728,9 @@ def run_single_analysis(
         "max_budget": max_budget,
         "budget_steps": budget_steps,
         "skip_flipped": skip_flipped,
+        "parallel": parallel,
+        "num_workers": effective_workers,
+        "word_ranking": use_word_ranking,
         "data_path": str(data_file),
     }
     with open(config_json_path, "w", encoding="utf-8") as f:
@@ -720,6 +873,27 @@ def parse_args():
         default=False,
         help="Skip running attack transformations on samples that already flipped detection in a previous budget step, speeding up degradation curve generation."
     )
+    parser.add_argument(
+        "--parallel", "--work-pool", "--use-work-pool",
+        dest="parallel",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable parallel execution via a worker pool (toggle off by default for small laptop experiments)."
+    )
+    parser.add_argument(
+        "--workers", "--num-workers", "-w",
+        dest="workers",
+        type=int,
+        default=None,
+        help="Number of workers in the work pool when --parallel is enabled (defaults to min(cpu_count, 8))."
+    )
+    parser.add_argument(
+        "--word-ranking", "--precompute-word-ranking", "--shared-word-ranking",
+        dest="word_ranking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Precompute word importance rankings once per sample and reuse them across budget steps and attack algorithms."
+    )
     return parser.parse_args()
 
 
@@ -740,33 +914,53 @@ def main():
     total_runs = len(detectors_to_run) * len(attackers_to_run)
     print(f"Executing {total_runs} separate analysis run(s) [{len(detectors_to_run)} detector(s) × {len(attackers_to_run)} attacker(s)]")
     print(f"Attackers: {', '.join(attackers_to_run)}")
-    print(f"Samples: {args.samples} | Budget Steps: {args.budget_steps} | Max Budget: {args.max_budget:.2%} | Skip Flipped: {args.skip_flipped}")
+    print(
+        f"Samples: {args.samples} | Budget Steps: {args.budget_steps} | "
+        f"Max Budget: {args.max_budget:.2%} | Skip Flipped: {args.skip_flipped} | "
+        f"Parallel: {args.parallel} | Word Ranking: {args.word_ranking}"
+    )
 
     run_idx = 0
     base_results_dir = Path(args.output_dir) if args.output_dir else Path(__file__).resolve().parent / "results" / timestamp
 
-    for det in detectors_to_run:
-        for att in attackers_to_run:
-            run_idx += 1
-            print(f"\n{'='*75}")
-            print(f"Run [{run_idx}/{total_runs}]: Detector={det} | Attacker={att}")
-            print(f"{'='*75}")
+    shared_pool = WorkPool(max_workers=args.workers) if args.parallel else None
+    if shared_pool is not None:
+        shared_pool.__enter__()
 
-            sub_output_dir = base_results_dir / f"{det}_{att}" if total_runs > 1 else base_results_dir
+    try:
+        for det in detectors_to_run:
+            # Share precomputed word rankings across all attackers for the same detector
+            shared_word_rankings: dict[int, list[tuple[int, float]]] | None = {} if args.word_ranking else None
 
-            run_single_analysis(
-                detector_type=det,
-                model_path=args.model_path,
-                attacker_type=att,
-                num_samples=args.samples,
-                max_budget=args.max_budget,
-                budget_steps=args.budget_steps,
-                seed=args.seed,
-                data_path=args.data_path,
-                output_dir=sub_output_dir,
-                timestamp=timestamp,
-                skip_flipped=args.skip_flipped,
-            )
+            for att in attackers_to_run:
+                run_idx += 1
+                print(f"\n{'='*75}")
+                print(f"Run [{run_idx}/{total_runs}]: Detector={det} | Attacker={att}")
+                print(f"{'='*75}")
+
+                sub_output_dir = base_results_dir / f"{det}_{att}" if total_runs > 1 else base_results_dir
+
+                run_single_analysis(
+                    detector_type=det,
+                    model_path=args.model_path,
+                    attacker_type=att,
+                    num_samples=args.samples,
+                    max_budget=args.max_budget,
+                    budget_steps=args.budget_steps,
+                    seed=args.seed,
+                    data_path=args.data_path,
+                    output_dir=sub_output_dir,
+                    timestamp=timestamp,
+                    skip_flipped=args.skip_flipped,
+                    parallel=args.parallel,
+                    num_workers=args.workers,
+                    work_pool=shared_pool,
+                    word_ranking=args.word_ranking,
+                    word_rankings=shared_word_rankings,
+                )
+    finally:
+        if shared_pool is not None:
+            shared_pool.shutdown()
 
     if args.report:
         try:

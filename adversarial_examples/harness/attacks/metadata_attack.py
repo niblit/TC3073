@@ -25,7 +25,7 @@ class TimestampSpoofing(MetadataTransformation):
         super().__init__(name)
         self.target_date = target_date
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         # Modifying a header costs 1 edit
         budget.consume(1) 
 
@@ -105,7 +105,7 @@ class SenderHeaderAttack(TargetedMetadataTransformation):
         super().__init__(name, target_model_oracle)
         self.candidates = candidates or list(DEFAULT_SENDER_CANDIDATES)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -201,7 +201,7 @@ class AuthenticationResultsAttack(TargetedMetadataTransformation):
         super().__init__(name, target_model_oracle)
         self.candidates = candidates or list(DEFAULT_AUTH_CANDIDATES)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -290,7 +290,7 @@ class ReceivedRoutingAttack(TargetedMetadataTransformation):
         super().__init__(name, target_model_oracle)
         self.candidates = candidates or list(DEFAULT_ROUTING_CANDIDATES)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -363,7 +363,7 @@ class XHeaderInjectionAttack(TargetedMetadataTransformation):
         super().__init__(name, target_model_oracle)
         self.candidates = candidates or list(DEFAULT_XHEADER_CANDIDATES)
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 
@@ -485,7 +485,7 @@ class SubjectMetadataAttack(TargetedMetadataTransformation):
 
         return candidates
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         if not text or not text.strip() or budget.remaining <= 0:
             return text
 

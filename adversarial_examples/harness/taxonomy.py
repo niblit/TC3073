@@ -1,5 +1,21 @@
+import inspect
 from abc import ABC, abstractmethod
 from harness.budget import PerturbationBudget
+
+
+def _call_apply(apply_fn, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
+    """
+    Invoke `apply_fn(text, budget, word_ranking=word_ranking)` if `apply_fn`
+    accepts `word_ranking` (or `**kwargs`), otherwise fall back to
+    `apply_fn(text, budget)` for backward compatibility with legacy subclasses.
+    """
+    sig = inspect.signature(apply_fn)
+    if "word_ranking" in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    ):
+        return apply_fn(text, budget, word_ranking=word_ranking)
+    return apply_fn(text, budget)
+
 
 class Transformation(ABC):
     """
@@ -8,14 +24,14 @@ class Transformation(ABC):
     def __init__(self, name: str):
         self.name = name
 
-    def transform(self, text: str, budget: PerturbationBudget) -> str:
+    def transform(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         """
         Public API to execute the transformation. 
         Subclasses implement _apply to house the actual logic.
         Validates intent preservation before returning.
         """
         # Logging could be injected here for reproducibility
-        transformed_text = self._apply(text, budget)
+        transformed_text = _call_apply(self._apply, text, budget, word_ranking=word_ranking)
         if not self.verify_intent(text, transformed_text):
             return text
         return transformed_text
@@ -105,7 +121,7 @@ class TargetedContentTransformation(ContentTransformation):
     def oracle(self, value):
         self._oracle = value
 
-    def transform(self, text: str, budget: PerturbationBudget) -> str:
+    def transform(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         """
         Public API. Validates that an oracle is set, then delegates to _apply.
         Skips verify_intent since the attack loop itself manages semantic fidelity
@@ -116,10 +132,10 @@ class TargetedContentTransformation(ContentTransformation):
                 f"{self.name} requires a target_model_oracle. "
                 "Set it via the constructor or the .oracle property."
             )
-        return self._apply(text, budget)
+        return _call_apply(self._apply, text, budget, word_ranking=word_ranking)
 
     @abstractmethod
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         pass
 
 class StructureTransformation(Transformation):
@@ -148,7 +164,7 @@ class TargetedStructureTransformation(StructureTransformation):
     def oracle(self, value):
         self._oracle = value
 
-    def transform(self, text: str, budget: PerturbationBudget) -> str:
+    def transform(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         """
         Public API. Validates that an oracle is set, then delegates to _apply.
         Skips verify_intent since the attack loop itself manages structural fidelity
@@ -159,10 +175,10 @@ class TargetedStructureTransformation(StructureTransformation):
                 f"{self.name} requires a target_model_oracle. "
                 "Set it via the constructor or the .oracle property."
             )
-        return self._apply(text, budget)
+        return _call_apply(self._apply, text, budget, word_ranking=word_ranking)
 
     @abstractmethod
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         pass
 
 class MetadataTransformation(Transformation):
@@ -191,7 +207,7 @@ class TargetedMetadataTransformation(MetadataTransformation):
     def oracle(self, value):
         self._oracle = value
 
-    def transform(self, text: str, budget: PerturbationBudget) -> str:
+    def transform(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         """
         Public API. Validates that an oracle is set, then delegates to _apply.
         Skips verify_intent since metadata modifications target delivery envelope
@@ -202,8 +218,8 @@ class TargetedMetadataTransformation(MetadataTransformation):
                 f"{self.name} requires a target_model_oracle. "
                 "Set it via the constructor or the .oracle property."
             )
-        return self._apply(text, budget)
+        return _call_apply(self._apply, text, budget, word_ranking=word_ranking)
 
     @abstractmethod
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
         pass

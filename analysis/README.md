@@ -51,14 +51,20 @@ python run_analysis.py \
   --budget-steps 20 \
   --seed 42 \
   --skip-flipped \
+  --parallel --workers 8 \
+  --word-ranking \
   --report
 ```
 
 *Note: Adding `--report` (or `--visualize`) automatically generates an interactive HTML dashboard in the results directory.*
 
-#### Performance Acceleration (`--skip-flipped`):
+#### Performance Acceleration (`--skip-flipped`, `--parallel`, `--word-ranking`):
 - `--skip-flipped` (aliases: `--skip-if-flipped`, `--early-stop`, `--no-skip-flipped`):
   When enabled, any sample that already flipped detection (`perturbed_pred != 1`) in an earlier budget step is skipped in all subsequent budget steps. Because adversarial algorithms stop running once they flip the detector, re-attacking already-evaded samples at larger budgets is redundant; skipping them reuses their flipped state and drastically accelerates degradation curve generation.
+- `--parallel` (aliases: `--work-pool`, `--use-work-pool`, `--no-parallel`) and `--workers N` (`-w N`):
+  When enabled, creates a worker pool (`WorkPool`) from which sample word-ranking and adversarial attack tasks are dynamically drawn in parallel. Disabled by default so small laptop experiments run sequentially with minimal resource overhead.
+- `--word-ranking` (aliases: `--precompute-word-ranking`, `--shared-word-ranking`, `--no-word-ranking`):
+  When enabled, precomputes the leave-one-out word importance ranking once per sample and passes the ranking to the attack algorithms across all budget steps and across different attackers on the same detector. If not provided (`None`), each algorithm computes its own word ranking on call as before.
 
 ### What it does:
 1. Loads a random sample of malicious texts from the dataset.

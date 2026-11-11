@@ -9,11 +9,36 @@ and Defense' — faithfully implements the four-step algorithm:
   4. Iterative greedy substitution with early termination on label flip
 """
 import string
+import threading
+from typing import List, Optional, Sequence, Tuple, Union
 import numpy as np
 import nltk
 from nltk.corpus import stopwords
 from harness.taxonomy import TargetedContentTransformation
 from harness.budget import PerturbationBudget
+
+
+def _normalize_word_ranking(
+    word_ranking: Sequence[Union[Tuple[int, float], int]],
+    num_words: int,
+) -> List[Tuple[int, float]]:
+    """
+    Normalize a provided word ranking into a list of (word_idx, importance_score)
+    tuples sorted descending by importance score.
+    Supports either (word_idx, score) tuples or plain integer word indices.
+    """
+    normalized: List[Tuple[int, float]] = []
+    for item in word_ranking:
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            idx, score = int(item[0]), float(item[1])
+        elif isinstance(item, int):
+            idx, score = int(item), 1.0
+        else:
+            continue
+        if 0 <= idx < num_words:
+            normalized.append((idx, score))
+    normalized.sort(key=lambda x: x[1], reverse=True)
+    return normalized
 
 for resource in ['stopwords', 'punkt_tab']:
     try:
@@ -81,6 +106,7 @@ class TextFoolerAttack(TargetedContentTransformation):
         self._cf_vectors = counter_fitted_vectors
         self._use_model = use_model
         self._spacy = spacy_model
+        self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Lazy model accessors (tests can inject mocks via constructor)
@@ -88,20 +114,26 @@ class TextFoolerAttack(TargetedContentTransformation):
 
     def _get_cf_vectors(self):
         if self._cf_vectors is None:
-            from harness.nlp_loader import get_counter_fitted_vectors
-            self._cf_vectors = get_counter_fitted_vectors()
+            with self._lock:
+                if self._cf_vectors is None:
+                    from harness.nlp_loader import get_counter_fitted_vectors
+                    self._cf_vectors = get_counter_fitted_vectors()
         return self._cf_vectors
 
     def _get_use_model(self):
         if self._use_model is None:
-            from harness.nlp_loader import get_use_model
-            self._use_model = get_use_model()
+            with self._lock:
+                if self._use_model is None:
+                    from harness.nlp_loader import get_use_model
+                    self._use_model = get_use_model()
         return self._use_model
 
     def _get_spacy(self):
         if self._spacy is None:
-            from harness.nlp_loader import get_spacy_model
-            self._spacy = get_spacy_model()
+            with self._lock:
+                if self._spacy is None:
+                    from harness.nlp_loader import get_spacy_model
+                    self._spacy = get_spacy_model()
         return self._spacy
 
     # ------------------------------------------------------------------
@@ -232,11 +264,16 @@ class TextFoolerAttack(TargetedContentTransformation):
     # Step 4: Iterative Attack Loop
     # ------------------------------------------------------------------
 
-    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+    def _apply(
+        self,
+        text: str,
+        budget: PerturbationBudget,
+        word_ranking: Optional[Sequence[Union[Tuple[int, float], int]]] = None,
+    ) -> str:
         """
         Execute the TextFooler attack:
           1. Query oracle for original prediction.
-          2. Rank words by importance.
+          2. Rank words by importance (or use precomputed `word_ranking` if provided).
           3. For each word (descending importance), while budget remains:
              a. Extract counter-fitted synonyms.
              b. Filter by POS + USE similarity.
@@ -257,9 +294,12 @@ class TextFoolerAttack(TargetedContentTransformation):
             return text
 
         # Step 1: Importance ranking
-        importance_ranking = self._compute_word_importance(
-            words, original_label, original_confidence
-        )
+        if word_ranking is not None:
+            importance_ranking = _normalize_word_ranking(word_ranking, len(words))
+        else:
+            importance_ranking = self._compute_word_importance(
+                words, original_label, original_confidence
+            )
 
         # Current state of the adversarial text (mutated in-place)
         current_words = words.copy()

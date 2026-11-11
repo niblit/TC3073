@@ -29,6 +29,13 @@ def main():
         "--oracle-confidence-key", type=str, default="confidence",
         help="JSON key for the confidence score in oracle output (default: 'confidence')."
     )
+    parser.add_argument(
+        "--word-ranking",
+        dest="word_ranking",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Precompute word importance ranking once and pass it to the attack algorithm."
+    )
     
     args, _ = parser.parse_known_args()
     
@@ -80,7 +87,7 @@ def main():
     
     try:
         from harness.budget import PerturbationBudget
-        from harness.attacks import TextFoolerAttack
+        from harness.attacks import TextFoolerAttack, compute_word_ranking
         
         # Compute max_edits based on the budget percentage and number of words
         word_count = len(text.split())
@@ -89,10 +96,11 @@ def main():
         
         # Apply TextFooler attack
         attack = TextFoolerAttack(target_model_oracle=oracle)
+        ranking = compute_word_ranking(text, oracle) if (args.word_ranking and oracle is not None) else None
         
         current_text = text
         try:
-            current_text = attack.transform(current_text, budget)
+            current_text = attack.transform(current_text, budget, word_ranking=ranking)
         except Exception:
             # If budget is exceeded or other transformation error occurs, just skip
             pass

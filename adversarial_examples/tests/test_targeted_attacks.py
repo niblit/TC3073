@@ -26,6 +26,7 @@ from harness.attacks import (
     HTMLEntityEncodingAttack,
     DOMWrapperAttack,
     HomoglyphSubstitutionAttack,
+    compute_word_ranking,
 )
 
 
@@ -310,3 +311,107 @@ class TestStructureAttacks:
         result = attack.transform(text, budget)
         assert result == text
         assert budget.consumed == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Word Ranking Precomputation & Sharing Tests
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestWordRankingSupport:
+    """Verify precomputed word ranking creation and usage across attack algorithms."""
+
+    def test_compute_word_ranking_orders_by_impact(self):
+        """compute_word_ranking removes one word at a time and orders descending by impact."""
+        text = "Please verify your account password"
+        # Words: 0="Please", 1="verify", 2="your", 3="account", 4="password"
+        def oracle(t):
+            if t == text:
+                return ("phishing", 0.95)
+            if "password" not in t:
+                return ("phishing", 0.30)  # drop = 0.65 (highest)
+            if "verify" not in t:
+                return ("phishing", 0.50)  # drop = 0.45 (second)
+            if "account" not in t:
+                return ("phishing", 0.80)  # drop = 0.15 (third)
+            return ("phishing", 0.94)
+
+        ranking = compute_word_ranking(text, oracle)
+        ranked_indices = [idx for idx, score in ranking if score > float("-inf")]
+        assert ranked_indices[:3] == [4, 1, 3]
+
+    def test_structure_attacks_use_provided_word_ranking_without_recomputing(self):
+        """
+        When word_ranking is provided to structure attacks, they must NOT query
+        the oracle with single-word deletions and must focus on the provided word order.
+        """
+        text = "alpha beta gamma"
+        # Force ranking to prioritize index 2 ("gamma") first, even though oracle
+        # would have ranked index 0 ("alpha") higher if recomputed.
+        provided_ranking = [(2, 0.99), (0, 0.10), (1, float("-inf"))]
+
+        for attack_cls in [
+            ZeroWidthInjectionAttack,
+            HTMLTagInjectionAttack,
+            HTMLEntityEncodingAttack,
+            HomoglyphSubstitutionAttack,
+        ]:
+            oracle_queries = []
+
+            def oracle(t):
+                oracle_queries.append(t)
+                return ("phishing", 0.50 if t != text else 0.95)
+
+            attack = attack_cls(target_model_oracle=oracle)
+            budget = PerturbationBudget(max_edits=1)
+            result = attack.transform(text, budget, word_ranking=provided_ranking)
+
+            # Ensure no single-word deletion queries ("beta gamma", "alpha gamma", "alpha beta") were made
+            deletion_queries = {"beta gamma", "alpha gamma", "alpha beta"}
+            assert deletion_queries.isdisjoint(set(oracle_queries)), (
+                f"{attack_cls.__name__} recomputed word importance despite word_ranking being provided!"
+            )
+
+            # With max_edits=1, only index 2 ("gamma") should be modified; "alpha" and "beta" stay intact
+            res_words = result.split()
+            assert res_words[0] == "alpha"
+            assert res_words[1] == "beta"
+            assert res_words[2] != "gamma"
+
+    def test_shared_word_ranking_across_multiple_attack_algorithms(self):
+        """
+        Compute word ranking once and pass it to multiple different attack algorithms.
+        """
+        text = "Please reset account credentials"
+        deletion_calls = []
+
+        def oracle(t):
+            if len(t.split()) < len(text.split()):
+                deletion_calls.append(t)
+                if "credentials" not in t:
+                    return ("phishing", 0.20)
+                return ("phishing", 0.90)
+            # Flip if "credentials" is perturbed
+            if "credentials" not in t.split():
+                return ("benign", 0.85)
+            return ("phishing", 0.95)
+
+        # Compute ranking ONCE
+        shared_ranking = compute_word_ranking(text, oracle)
+        initial_deletion_count = len(deletion_calls)
+        assert initial_deletion_count > 0
+
+        # Run 4 different structure attacks with the shared ranking
+        for attack_cls in [
+            ZeroWidthInjectionAttack,
+            HTMLTagInjectionAttack,
+            HTMLEntityEncodingAttack,
+            HomoglyphSubstitutionAttack,
+        ]:
+            attack = attack_cls(target_model_oracle=oracle)
+            budget = PerturbationBudget(max_edits=1)
+            perturbed = attack.transform(text, budget, word_ranking=shared_ranking)
+            assert perturbed != text
+            assert budget.consumed == 1
+
+        # Zero additional deletion queries should have occurred across all 4 attacks!
+        assert len(deletion_calls) == initial_deletion_count

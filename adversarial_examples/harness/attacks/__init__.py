@@ -36,6 +36,7 @@ from harness.attacks.structure_attack import (
     HTMLEntityEncodingAttack,
     DOMWrapperAttack,
     HomoglyphSubstitutionAttack,
+    compute_word_ranking,
 )
 
 __all__ = [
@@ -48,6 +49,7 @@ __all__ = [
     "HTMLEntityEncodingAttack",
     "DOMWrapperAttack",
     "HomoglyphSubstitutionAttack",
+    "compute_word_ranking",
     # Metadata
     "TimestampSpoofing",
     "SenderHeaderAttack",

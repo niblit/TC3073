@@ -1,4 +1,5 @@
 import os
+import threading
 import spacy
 from sentence_transformers import SentenceTransformer
 
@@ -6,19 +7,24 @@ _nlp_spacy = None
 _sentence_model = None
 _use_model = None
 _counter_fitted_vectors = None
+_loader_lock = threading.Lock()
 
 def get_spacy_model():
     """Lazily loads and returns the spaCy en_core_web_sm model."""
     global _nlp_spacy
     if _nlp_spacy is None:
-        _nlp_spacy = spacy.load("en_core_web_sm")
+        with _loader_lock:
+            if _nlp_spacy is None:
+                _nlp_spacy = spacy.load("en_core_web_sm")
     return _nlp_spacy
 
 def get_sentence_transformer():
     """Lazily loads and returns the SentenceTransformer model."""
     global _sentence_model
     if _sentence_model is None:
-        _sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        with _loader_lock:
+            if _sentence_model is None:
+                _sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
     return _sentence_model
 
 def get_use_model():
@@ -30,8 +36,10 @@ def get_use_model():
     """
     global _use_model
     if _use_model is None:
-        import tensorflow_hub as hub
-        _use_model = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
+        with _loader_lock:
+            if _use_model is None:
+                import tensorflow_hub as hub
+                _use_model = hub.load("https://tfhub.dev/google/universal-sentence-encoder/4")
     return _use_model
 
 def get_counter_fitted_vectors(vectors_path=None):
@@ -47,16 +55,18 @@ def get_counter_fitted_vectors(vectors_path=None):
     """
     global _counter_fitted_vectors
     if _counter_fitted_vectors is None:
-        from gensim.models import KeyedVectors
-        
-        if vectors_path is None:
-            vectors_path = os.environ.get(
-                "COUNTER_FITTED_VECTORS_PATH",
-                os.path.join(os.path.dirname(os.path.dirname(__file__)),
-                             "data", "counter-fitted-vectors.txt")
-            )
-        
-        _counter_fitted_vectors = KeyedVectors.load_word2vec_format(
-            vectors_path, binary=False, no_header=True
-        )
+        with _loader_lock:
+            if _counter_fitted_vectors is None:
+                from gensim.models import KeyedVectors
+                
+                if vectors_path is None:
+                    vectors_path = os.environ.get(
+                        "COUNTER_FITTED_VECTORS_PATH",
+                        os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                     "data", "counter-fitted-vectors.txt")
+                    )
+                
+                _counter_fitted_vectors = KeyedVectors.load_word2vec_format(
+                    vectors_path, binary=False, no_header=True
+                )
     return _counter_fitted_vectors
