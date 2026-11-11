@@ -5,9 +5,9 @@ Degradation Curve Analysis
 Measures how a detector's accuracy degrades as the adversarial
 perturbation budget increases up to the defined MAX_BUDGET.
 
-Supports easily switching between any detector from detector_zoo
-(Logistic Regression, CharCNN, Transformer / DistilBERT) and
-adversarial attack harnesses.
+Supports running single or multi-attacker evaluations across any detector
+from detector_zoo (Logistic Regression, CharCNN, Transformer / DistilBERT)
+and adversarial attack harnesses.
 """
 
 import sys
@@ -46,9 +46,22 @@ from src.transformer_detector import TransformerDetector
 
 from harness.budget import PerturbationBudget
 from harness.attacks import (
+    # Content
     TextFoolerAttack,
+    # Structure
     HTMLCommentInjection,
+    ZeroWidthInjectionAttack,
+    HTMLTagInjectionAttack,
+    HTMLEntityEncodingAttack,
+    DOMWrapperAttack,
+    HomoglyphSubstitutionAttack,
+    # Metadata
     TimestampSpoofing,
+    SenderHeaderAttack,
+    AuthenticationResultsAttack,
+    ReceivedRoutingAttack,
+    XHeaderInjectionAttack,
+    SubjectMetadataAttack,
 )
 
 # ---------------------------------------------------------------------------
@@ -76,22 +89,103 @@ DETECTOR_REGISTRY = {
 }
 
 ATTACKER_REGISTRY = {
+    # ── 5 Metadata Attacks ──
+    "sender_header": {
+        "factory": lambda oracle: SenderHeaderAttack(target_model_oracle=oracle),
+        "display_name": "Sender Header Attack",
+        "aliases": ["sender", "from_header", "sender_header_attack"],
+        "category": "metadata",
+    },
+    "auth_results": {
+        "factory": lambda oracle: AuthenticationResultsAttack(target_model_oracle=oracle),
+        "display_name": "Authentication Results Attack",
+        "aliases": ["auth", "spf_dkim", "authentication_results", "authentication_results_attack"],
+        "category": "metadata",
+    },
+    "received_routing": {
+        "factory": lambda oracle: ReceivedRoutingAttack(target_model_oracle=oracle),
+        "display_name": "Received Routing Attack",
+        "aliases": ["routing", "received", "mta", "received_routing_attack"],
+        "category": "metadata",
+    },
+    "x_header": {
+        "factory": lambda oracle: XHeaderInjectionAttack(target_model_oracle=oracle),
+        "display_name": "X-Header Injection Attack",
+        "aliases": ["x_headers", "spam_status", "x_header_injection", "x_header_injection_attack"],
+        "category": "metadata",
+    },
+    "subject_metadata": {
+        "factory": lambda oracle: SubjectMetadataAttack(target_model_oracle=oracle),
+        "display_name": "Subject Metadata Attack",
+        "aliases": ["subject", "subject_tag", "subject_metadata_attack"],
+        "category": "metadata",
+    },
+
+    # ── 5 Structure Attacks ──
+    "zero_width": {
+        "factory": lambda oracle: ZeroWidthInjectionAttack(target_model_oracle=oracle),
+        "display_name": "Zero-Width Injection Attack",
+        "aliases": ["zw", "zero_width_space", "zero_width_injection", "zero_width_injection_attack"],
+        "category": "structure",
+    },
+    "html_tag": {
+        "factory": lambda oracle: HTMLTagInjectionAttack(target_model_oracle=oracle),
+        "display_name": "HTML Tag Injection Attack",
+        "aliases": ["tag_injection", "inline_tag", "html_tag_injection", "html_tag_injection_attack"],
+        "category": "structure",
+    },
+    "html_entity": {
+        "factory": lambda oracle: HTMLEntityEncodingAttack(target_model_oracle=oracle),
+        "display_name": "HTML Entity Encoding Attack",
+        "aliases": ["entities", "entity_encoding", "html_entity_encoding", "html_entity_encoding_attack"],
+        "category": "structure",
+    },
+    "dom_wrapper": {
+        "factory": lambda oracle: DOMWrapperAttack(target_model_oracle=oracle),
+        "display_name": "DOM Wrapper Attack",
+        "aliases": ["wrapper", "dom", "dom_structure", "dom_wrapper_attack"],
+        "category": "structure",
+    },
+    "homoglyph": {
+        "factory": lambda oracle: HomoglyphSubstitutionAttack(target_model_oracle=oracle),
+        "display_name": "Homoglyph Substitution Attack",
+        "aliases": ["homoglyphs", "confusables", "homoglyph_substitution", "homoglyph_substitution_attack"],
+        "category": "structure",
+    },
+
+    # ── Legacy Baseline Attacks ──
     "textfooler": {
         "factory": lambda oracle: TextFoolerAttack(target_model_oracle=oracle),
         "display_name": "TextFooler",
-        "aliases": ["text_fooler"],
+        "aliases": ["text_fooler", "content"],
+        "category": "content",
     },
     "html_comment": {
         "factory": lambda oracle=None: HTMLCommentInjection(),
-        "display_name": "HTML Comment Injection",
-        "aliases": ["comment", "structure"],
+        "display_name": "HTML Comment Injection (Legacy)",
+        "aliases": ["comment"],
+        "category": "structure",
     },
     "timestamp": {
         "factory": lambda oracle=None: TimestampSpoofing(),
-        "display_name": "Timestamp Spoofing",
-        "aliases": ["spoofing", "metadata"],
+        "display_name": "Timestamp Spoofing (Legacy)",
+        "aliases": ["spoofing"],
+        "category": "metadata",
     },
 }
+
+NEW_ATTACKERS = [
+    "sender_header",
+    "auth_results",
+    "received_routing",
+    "x_header",
+    "subject_metadata",
+    "zero_width",
+    "html_tag",
+    "html_entity",
+    "dom_wrapper",
+    "homoglyph",
+]
 
 
 def resolve_detector(name_or_alias: str):
@@ -107,7 +201,7 @@ def resolve_detector(name_or_alias: str):
 
 
 def resolve_attacker(name_or_alias: str):
-    """Normalize and resolve attacker specification from name or alias."""
+    """Normalize and resolve a single attacker specification from name or alias."""
     clean = name_or_alias.strip().lower().replace("-", "_")
     for key, spec in ATTACKER_REGISTRY.items():
         if clean == key or clean in spec["aliases"]:
@@ -118,10 +212,44 @@ def resolve_attacker(name_or_alias: str):
     )
 
 
+def resolve_attackers(spec_str: str) -> list[str]:
+    """
+    Resolves an attacker specification string into a list of canonical attacker keys.
+    Supports:
+    - 'new' or 'new_attacks': the 10 new metadata + structure attacks
+    - 'all': all registered attackers
+    - 'metadata': all metadata attackers
+    - 'structure': all structure attackers
+    - Comma-separated list: e.g. 'sender_header,zero_width'
+    - Single attacker name or alias
+    """
+    clean = spec_str.strip().lower()
+    if clean in ("new", "new_attacks", "new_attack"):
+        return list(NEW_ATTACKERS)
+    if clean == "all":
+        return list(ATTACKER_REGISTRY.keys())
+    if clean in ("metadata", "meta"):
+        return [k for k, v in ATTACKER_REGISTRY.items() if v.get("category") == "metadata"]
+    if clean in ("structure", "struct"):
+        return [k for k, v in ATTACKER_REGISTRY.items() if v.get("category") == "structure"]
+
+    parts = [p.strip() for p in spec_str.split(",") if p.strip()]
+    resolved_keys = []
+    for part in parts:
+        key, _ = resolve_attacker(part)
+        if key not in resolved_keys:
+            resolved_keys.append(key)
+    return resolved_keys
+
+
 # ---------------------------------------------------------------------------
 # Data & Model Helpers
 # ---------------------------------------------------------------------------
-def load_malicious_samples(path: Path, n: int, seed: int) -> list[dict]:
+def load_malicious_samples(path: Path, n: int, seed: int, detector=None) -> list[dict]:
+    """
+    Loads malicious samples (label=1) deterministically.
+    If detector is provided, filters for samples that the detector actually detects (pred=1).
+    """
     print(f"Loading data from {path} ...")
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -129,12 +257,24 @@ def load_malicious_samples(path: Path, n: int, seed: int) -> list[dict]:
     malicious = [item for item in data if item.get("label") == 1]
     print(f"  Total entries: {len(data)}, malicious: {len(malicious)}")
 
+    random.seed(seed)
+    shuffled = random.sample(malicious, len(malicious))
+
+    if detector is not None:
+        detected = []
+        for s in shuffled:
+            pred = detector.predict([s["text"]])[0]
+            if pred == 1:
+                detected.append(s)
+                if len(detected) == n:
+                    break
+        print(f"  Found {len(detected)} samples detected as malicious by target detector.")
+        return detected
+
     if len(malicious) < n:
         print(f"  WARNING: only {len(malicious)} malicious samples available")
         n = len(malicious)
-
-    random.seed(seed)
-    return random.sample(malicious, n)
+    return shuffled[:n]
 
 
 def load_detector(detector_type: str, model_path: Path | str | None = None):
@@ -172,16 +312,18 @@ def attack_text(text: str, budget_frac: float, attacker) -> tuple[str, int, bool
         perturbed = text
         success = False
 
-    # Calculate real budget consumed (word differences)
+    # Calculate real budget consumed (word differences or budget.consumed)
     orig_words = text.split()
     pert_words = perturbed.split()
     min_len = min(len(orig_words), len(pert_words))
 
     consumed = sum(1 for i in range(min_len) if orig_words[i] != pert_words[i])
     consumed += abs(len(orig_words) - len(pert_words))
+    if consumed == 0 and budget.consumed > 0:
+        consumed = budget.consumed
 
     # If budget was requested but no edits were made, mark as failed
-    if budget_frac > 0 and consumed == 0:
+    if budget_frac > 0 and consumed == 0 and perturbed == text:
         success = False
 
     return perturbed, consumed, success
@@ -193,10 +335,10 @@ def attack_text(text: str, budget_frac: float, attacker) -> tuple[str, int, bool
 def run_single_analysis(
     detector_type: str = "logistic_regression",
     model_path: Path | str | None = None,
-    attacker_type: str = "textfooler",
+    attacker_type: str = "sender_header",
     num_samples: int = 10,
     max_budget: float = 0.20,
-    budget_steps: int = 20,
+    budget_steps: int = 3,
     seed: int = 42,
     data_path: Path | str | None = None,
     output_dir: Path | str | None = None,
@@ -212,15 +354,15 @@ def run_single_analysis(
     if output_dir:
         results_dir = Path(output_dir)
     else:
-        results_dir = Path(__file__).resolve().parent / "results" / timestamp / det_key
+        results_dir = Path(__file__).resolve().parent / "results" / timestamp / f"{det_key}_{att_key}"
 
     results_dir.mkdir(parents=True, exist_ok=True)
 
     # Calculate budget sweep
     budgets = [round((i / budget_steps) * max_budget, 4) for i in range(1, budget_steps + 1)]
 
-    # Load dataset
-    samples = load_malicious_samples(data_file, num_samples, seed)
+    # Load dataset (filtered for samples detected as malicious)
+    samples = load_malicious_samples(data_file, num_samples, seed, detector=detector)
 
     # Initialize oracle and attacker
     oracle = create_oracle(detector)
@@ -362,8 +504,8 @@ def run_single_analysis(
     # ------------------------------------------------------------------
     run_config = {
         "timestamp": timestamp,
-        "detector_key": det_key,
-        "detector_display_name": det_spec["display_name"],
+        "detector_key": f"{det_key}_{att_key}",
+        "detector_display_name": f"{det_spec['display_name']} - {att_spec['display_name']}",
         "model_path": str(resolved_model_path),
         "attacker_key": att_key,
         "attacker_display_name": att_spec["display_name"],
@@ -459,19 +601,16 @@ def parse_args():
         default=None,
         help="Custom path to trained model (overrides default path for the chosen detector)."
     )
-    all_attackers = list(ATTACKER_REGISTRY.keys())
-    all_att_aliases = [alias for s in ATTACKER_REGISTRY.values() for alias in s["aliases"]]
     parser.add_argument(
         "--attacker", "-a",
         type=str,
-        default="textfooler",
-        choices=all_attackers + all_att_aliases,
-        help="Adversarial attack algorithm to apply."
+        default="new",
+        help="Adversarial attack algorithm to apply. Can be 'new' (runs all 10 new attacks), 'all', 'metadata', 'structure', a specific attack name, or comma-separated attack names."
     )
     parser.add_argument(
         "--samples", "-n",
         type=int,
-        default=1,
+        default=10,
         help="Number of malicious samples to evaluate."
     )
     parser.add_argument(
@@ -483,7 +622,7 @@ def parse_args():
     parser.add_argument(
         "--budget-steps", "-s",
         type=int,
-        default=1,
+        default=3,
         help="Number of evenly spaced budget steps from >0 up to max-budget."
     )
     parser.add_argument(
@@ -507,6 +646,7 @@ def parse_args():
     parser.add_argument(
         "--report", "--visualize",
         action="store_true",
+        default=True,
         help="Automatically generate an interactive HTML report after analysis completes."
     )
     return parser.parse_args()
@@ -516,41 +656,50 @@ def main():
     args = parse_args()
     timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
+    # Resolve detectors
     if args.detector.lower() == "all":
         detectors_to_run = list(DETECTOR_REGISTRY.keys())
-        print(f"Running evaluation sweep across all detectors: {detectors_to_run}")
-        for det in detectors_to_run:
-            print(f"\n{'='*70}\nRunning analysis for detector: {det}\n{'='*70}")
+    else:
+        det_key, _ = resolve_detector(args.detector)
+        detectors_to_run = [det_key]
+
+    # Resolve attackers
+    attackers_to_run = resolve_attackers(args.attacker)
+
+    total_runs = len(detectors_to_run) * len(attackers_to_run)
+    print(f"Executing {total_runs} separate analysis run(s) [{len(detectors_to_run)} detector(s) × {len(attackers_to_run)} attacker(s)]")
+    print(f"Attackers: {', '.join(attackers_to_run)}")
+    print(f"Samples: {args.samples} | Budget Steps: {args.budget_steps} | Max Budget: {args.max_budget:.2%}")
+
+    run_idx = 0
+    base_results_dir = Path(args.output_dir) if args.output_dir else Path(__file__).resolve().parent / "results" / timestamp
+
+    for det in detectors_to_run:
+        for att in attackers_to_run:
+            run_idx += 1
+            print(f"\n{'='*75}")
+            print(f"Run [{run_idx}/{total_runs}]: Detector={det} | Attacker={att}")
+            print(f"{'='*75}")
+
+            sub_output_dir = base_results_dir / f"{det}_{att}" if total_runs > 1 else base_results_dir
+
             run_single_analysis(
                 detector_type=det,
                 model_path=args.model_path,
-                attacker_type=args.attacker,
+                attacker_type=att,
                 num_samples=args.samples,
                 max_budget=args.max_budget,
                 budget_steps=args.budget_steps,
                 seed=args.seed,
                 data_path=args.data_path,
-                output_dir=args.output_dir,
+                output_dir=sub_output_dir,
                 timestamp=timestamp,
             )
-    else:
-        run_single_analysis(
-            detector_type=args.detector,
-            model_path=args.model_path,
-            attacker_type=args.attacker,
-            num_samples=args.samples,
-            max_budget=args.max_budget,
-            budget_steps=args.budget_steps,
-            seed=args.seed,
-            data_path=args.data_path,
-            output_dir=args.output_dir,
-            timestamp=timestamp,
-        )
 
     if args.report:
         try:
             from visualize_results import resolve_results_directory, load_detector_run, build_html_report
-            target_dir = Path(args.output_dir) if args.output_dir else Path(__file__).resolve().parent / "results" / timestamp
+            target_dir = base_results_dir
             base_dir, detector_dirs = resolve_results_directory(str(target_dir))
             data = [load_detector_run(d) for d in detector_dirs]
             html_content = build_html_report(f"Degradation Analysis ({timestamp})", base_dir, data)
@@ -558,7 +707,9 @@ def main():
             report_file.write_text(html_content, encoding="utf-8")
             print(f"\n[REPORT] Interactive HTML report created: {report_file}")
         except Exception as e:
+            import traceback
             print(f"\n[WARNING] Could not auto-generate report: {e}")
+            traceback.print_exc()
 
 
 if __name__ == "__main__":

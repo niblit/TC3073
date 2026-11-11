@@ -128,8 +128,82 @@ class StructureTransformation(Transformation):
     """
     pass
 
+class TargetedStructureTransformation(StructureTransformation):
+    """
+    Structure transformation that requires black-box access to a target model.
+
+    The target_model_oracle is a callable with the signature:
+        oracle(text: str) -> Tuple[str, float]
+    It returns (predicted_label, confidence_score) for the given input text.
+    """
+    def __init__(self, name: str, target_model_oracle=None):
+        super().__init__(name)
+        self._oracle = target_model_oracle
+
+    @property
+    def oracle(self):
+        return self._oracle
+
+    @oracle.setter
+    def oracle(self, value):
+        self._oracle = value
+
+    def transform(self, text: str, budget: PerturbationBudget) -> str:
+        """
+        Public API. Validates that an oracle is set, then delegates to _apply.
+        Skips verify_intent since the attack loop itself manages structural fidelity
+        internally.
+        """
+        if self._oracle is None:
+            raise ValueError(
+                f"{self.name} requires a target_model_oracle. "
+                "Set it via the constructor or the .oracle property."
+            )
+        return self._apply(text, budget)
+
+    @abstractmethod
+    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+        pass
+
 class MetadataTransformation(Transformation):
     """
     Transformations targeting the delivery mechanism (e.g., Sender headers, timestamps).
     """
     pass
+
+class TargetedMetadataTransformation(MetadataTransformation):
+    """
+    Metadata transformation that requires black-box access to a target model.
+
+    The target_model_oracle is a callable with the signature:
+        oracle(text: str) -> Tuple[str, float]
+    It returns (predicted_label, confidence_score) for the given input text.
+    """
+    def __init__(self, name: str, target_model_oracle=None):
+        super().__init__(name)
+        self._oracle = target_model_oracle
+
+    @property
+    def oracle(self):
+        return self._oracle
+
+    @oracle.setter
+    def oracle(self, value):
+        self._oracle = value
+
+    def transform(self, text: str, budget: PerturbationBudget) -> str:
+        """
+        Public API. Validates that an oracle is set, then delegates to _apply.
+        Skips verify_intent since metadata modifications target delivery envelope
+        rather than core semantic invariants.
+        """
+        if self._oracle is None:
+            raise ValueError(
+                f"{self.name} requires a target_model_oracle. "
+                "Set it via the constructor or the .oracle property."
+            )
+        return self._apply(text, budget)
+
+    @abstractmethod
+    def _apply(self, text: str, budget: PerturbationBudget) -> str:
+        pass

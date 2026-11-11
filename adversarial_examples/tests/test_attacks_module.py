@@ -8,12 +8,36 @@ from harness.attacks import (
     TextFoolerAttack,
     TimestampSpoofing,
     HTMLCommentInjection,
+    SenderHeaderAttack,
+    AuthenticationResultsAttack,
+    ReceivedRoutingAttack,
+    XHeaderInjectionAttack,
+    SubjectMetadataAttack,
+    ZeroWidthInjectionAttack,
+    HTMLTagInjectionAttack,
+    HTMLEntityEncodingAttack,
+    DOMWrapperAttack,
+    HomoglyphSubstitutionAttack,
 )
 from harness.attacks.content_attacks import (
     TextFoolerAttack as ContentTextFoolerAttack,
 )
-from harness.attacks.structure_attack import HTMLCommentInjection as StructHTMLCommentInjection
-from harness.attacks.metadata_attack import TimestampSpoofing as MetaTimestampSpoofing
+from harness.attacks.structure_attack import (
+    HTMLCommentInjection as StructHTMLCommentInjection,
+    ZeroWidthInjectionAttack as StructZeroWidthInjectionAttack,
+    HTMLTagInjectionAttack as StructHTMLTagInjectionAttack,
+    HTMLEntityEncodingAttack as StructHTMLEntityEncodingAttack,
+    DOMWrapperAttack as StructDOMWrapperAttack,
+    HomoglyphSubstitutionAttack as StructHomoglyphSubstitutionAttack,
+)
+from harness.attacks.metadata_attack import (
+    TimestampSpoofing as MetaTimestampSpoofing,
+    SenderHeaderAttack as MetaSenderHeaderAttack,
+    AuthenticationResultsAttack as MetaAuthenticationResultsAttack,
+    ReceivedRoutingAttack as MetaReceivedRoutingAttack,
+    XHeaderInjectionAttack as MetaXHeaderInjectionAttack,
+    SubjectMetadataAttack as MetaSubjectMetadataAttack,
+)
 
 
 def test_attacks_module_exports():
@@ -21,9 +45,34 @@ def test_attacks_module_exports():
     assert TextFoolerAttack is ContentTextFoolerAttack
     assert TimestampSpoofing is MetaTimestampSpoofing
     assert HTMLCommentInjection is StructHTMLCommentInjection
-    assert "TextFoolerAttack" in harness.attacks.__all__
-    assert "HTMLCommentInjection" in harness.attacks.__all__
-    assert "TimestampSpoofing" in harness.attacks.__all__
+    assert SenderHeaderAttack is MetaSenderHeaderAttack
+    assert AuthenticationResultsAttack is MetaAuthenticationResultsAttack
+    assert ReceivedRoutingAttack is MetaReceivedRoutingAttack
+    assert XHeaderInjectionAttack is MetaXHeaderInjectionAttack
+    assert SubjectMetadataAttack is MetaSubjectMetadataAttack
+    assert ZeroWidthInjectionAttack is StructZeroWidthInjectionAttack
+    assert HTMLTagInjectionAttack is StructHTMLTagInjectionAttack
+    assert HTMLEntityEncodingAttack is StructHTMLEntityEncodingAttack
+    assert DOMWrapperAttack is StructDOMWrapperAttack
+    assert HomoglyphSubstitutionAttack is StructHomoglyphSubstitutionAttack
+
+    expected_exports = [
+        "TextFoolerAttack",
+        "TimestampSpoofing",
+        "HTMLCommentInjection",
+        "SenderHeaderAttack",
+        "AuthenticationResultsAttack",
+        "ReceivedRoutingAttack",
+        "XHeaderInjectionAttack",
+        "SubjectMetadataAttack",
+        "ZeroWidthInjectionAttack",
+        "HTMLTagInjectionAttack",
+        "HTMLEntityEncodingAttack",
+        "DOMWrapperAttack",
+        "HomoglyphSubstitutionAttack",
+    ]
+    for export_name in expected_exports:
+        assert export_name in harness.attacks.__all__
 
 
 def test_html_comment_injection():
