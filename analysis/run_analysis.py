@@ -343,6 +343,7 @@ def run_single_analysis(
     data_path: Path | str | None = None,
     output_dir: Path | str | None = None,
     timestamp: str | None = None,
+    skip_flipped: bool = False,
 ):
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -421,42 +422,103 @@ def run_single_analysis(
     print(f"Saving results to: {results_dir}")
     print(f"Running {total_steps} budget levels × {num_valid} samples = {total_steps * num_valid} attack runs ...\n")
 
+    # Track samples that have already flipped detection (pred != 1)
+    flipped_samples = {}  # sample_idx -> dict of cached results
+
     for step_idx, budget_frac in enumerate(budgets):
         pct = int(budget_frac * 100)
-        print(f"  [{step_idx + 1:3d}/{total_steps}] Budget = {pct:3d}% ...", end="", flush=True)
 
-        perturbed_texts = []
-        consumed_budgets = []
-        success_flags = []
+        # Determine which samples need attacking in this budget step
+        if skip_flipped:
+            active_indices = [i for i in range(num_valid) if i not in flipped_samples]
+            skipped_count = num_valid - len(active_indices)
+        else:
+            active_indices = list(range(num_valid))
+            skipped_count = 0
 
-        for text in original_texts:
+        status_prefix = f"  [{step_idx + 1:3d}/{total_steps}] Budget = {pct:3d}%"
+        if skip_flipped and skipped_count > 0:
+            print(f"{status_prefix} (active: {len(active_indices)}/{num_valid}, skipped: {skipped_count}) ...", end="", flush=True)
+        else:
+            print(f"{status_prefix} ...", end="", flush=True)
+
+        active_perturbed = {}
+        active_consumed = {}
+        active_success = {}
+
+        for i in active_indices:
+            text = original_texts[i]
             pert, cons, succ = attack_text(text, budget_frac, attacker)
-            perturbed_texts.append(pert)
-            consumed_budgets.append(cons)
-            success_flags.append(succ)
+            active_perturbed[i] = pert
+            active_consumed[i] = cons
+            active_success[i] = succ
 
-        pert_preds = detector.predict(perturbed_texts)
-        pert_probas = detector.predict_proba(perturbed_texts)
-        pert_confidences = [prob[1] for prob in pert_probas]
+        if active_indices:
+            active_texts = [active_perturbed[i] for i in active_indices]
+            active_preds = detector.predict(active_texts)
+            active_probas = detector.predict_proba(active_texts)
+            active_confidences = [prob[1] for prob in active_probas]
+        else:
+            active_preds = []
+            active_confidences = []
+
+        # Build full result lists for all samples in this step
+        step_perturbed_texts = []
+        step_consumed_budgets = []
+        step_success_flags = []
+        step_pert_preds = []
+        step_pert_confidences = []
+
+        active_pos = 0
+        for i in range(num_valid):
+            if skip_flipped and i in flipped_samples:
+                prev = flipped_samples[i]
+                step_perturbed_texts.append(prev["perturbed_text"])
+                step_consumed_budgets.append(prev["consumed_budget"])
+                step_success_flags.append(prev["success"])
+                step_pert_preds.append(prev["perturbed_pred"])
+                step_pert_confidences.append(prev["perturbed_confidence"])
+            else:
+                p_text = active_perturbed[i]
+                p_cons = active_consumed[i]
+                p_succ = active_success[i]
+                p_pred = int(active_preds[active_pos])
+                p_conf = float(active_confidences[active_pos])
+                active_pos += 1
+
+                step_perturbed_texts.append(p_text)
+                step_consumed_budgets.append(p_cons)
+                step_success_flags.append(p_succ)
+                step_pert_preds.append(p_pred)
+                step_pert_confidences.append(p_conf)
+
+                if skip_flipped and p_pred != 1:
+                    flipped_samples[i] = {
+                        "perturbed_text": p_text,
+                        "consumed_budget": p_cons,
+                        "success": p_succ,
+                        "perturbed_pred": p_pred,
+                        "perturbed_confidence": p_conf,
+                    }
 
         evasions = 0
         for i in range(num_valid):
-            evaded = int(pert_preds[i] != 1)
+            evaded = int(step_pert_preds[i] != 1)
             evasions += evaded
 
             orig_b64 = base64.b64encode(original_texts[i].encode("utf-8")).decode("utf-8")
-            pert_b64 = base64.b64encode(perturbed_texts[i].encode("utf-8")).decode("utf-8")
+            pert_b64 = base64.b64encode(step_perturbed_texts[i].encode("utf-8")).decode("utf-8")
 
             raw_writer.writerow({
                 "budget": budget_frac,
                 "sample_idx": i,
                 "original_pred": 1,
-                "perturbed_pred": int(pert_preds[i]),
+                "perturbed_pred": int(step_pert_preds[i]),
                 "original_confidence": round(orig_confidences[i], 6),
-                "perturbed_confidence": round(pert_confidences[i], 6),
+                "perturbed_confidence": round(step_pert_confidences[i], 6),
                 "evaded": evaded,
-                "real_budget_consumed": consumed_budgets[i],
-                "transformation_success": success_flags[i],
+                "real_budget_consumed": step_consumed_budgets[i],
+                "transformation_success": step_success_flags[i],
                 "original_text_b64": orig_b64,
                 "perturbed_text_b64": pert_b64
             })
@@ -467,12 +529,12 @@ def run_single_analysis(
         se_det = (detection_rate * (1.0 - detection_rate) / num_valid) ** 0.5 if num_valid > 0 else 0.0
 
         mean_orig_conf = sum(orig_confidences) / num_valid
-        mean_pert_conf = sum(pert_confidences) / num_valid
-        std_pert_conf = statistics.stdev(pert_confidences) if num_valid > 1 else 0.0
+        mean_pert_conf = sum(step_pert_confidences) / num_valid
+        std_pert_conf = statistics.stdev(step_pert_confidences) if num_valid > 1 else 0.0
         mean_drop = mean_orig_conf - mean_pert_conf
 
-        mean_consumed = sum(consumed_budgets) / num_valid
-        failed_count = sum(1 for s in success_flags if not s)
+        mean_consumed = sum(step_consumed_budgets) / num_valid
+        failed_count = sum(1 for s in step_success_flags if not s)
 
         aggregated_rows.append({
             "budget": budget_frac,
@@ -487,7 +549,8 @@ def run_single_analysis(
             "failed_transformations": failed_count
         })
 
-        print(f"  det={detection_rate:.2%}  Δconf={mean_drop:+.4f}  failures={failed_count}")
+        skip_info = f"  skipped={skipped_count}" if skip_flipped else ""
+        print(f"  det={detection_rate:.2%}  Δconf={mean_drop:+.4f}  failures={failed_count}{skip_info}")
 
     raw_file.close()
 
@@ -514,6 +577,7 @@ def run_single_analysis(
         "seed": seed,
         "max_budget": max_budget,
         "budget_steps": budget_steps,
+        "skip_flipped": skip_flipped,
         "data_path": str(data_file),
     }
     with open(config_json_path, "w", encoding="utf-8") as f:
@@ -649,6 +713,13 @@ def parse_args():
         default=True,
         help="Automatically generate an interactive HTML report after analysis completes."
     )
+    parser.add_argument(
+        "--skip-flipped", "--skip-if-flipped", "--early-stop",
+        dest="skip_flipped",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Skip running attack transformations on samples that already flipped detection in a previous budget step, speeding up degradation curve generation."
+    )
     return parser.parse_args()
 
 
@@ -669,7 +740,7 @@ def main():
     total_runs = len(detectors_to_run) * len(attackers_to_run)
     print(f"Executing {total_runs} separate analysis run(s) [{len(detectors_to_run)} detector(s) × {len(attackers_to_run)} attacker(s)]")
     print(f"Attackers: {', '.join(attackers_to_run)}")
-    print(f"Samples: {args.samples} | Budget Steps: {args.budget_steps} | Max Budget: {args.max_budget:.2%}")
+    print(f"Samples: {args.samples} | Budget Steps: {args.budget_steps} | Max Budget: {args.max_budget:.2%} | Skip Flipped: {args.skip_flipped}")
 
     run_idx = 0
     base_results_dir = Path(args.output_dir) if args.output_dir else Path(__file__).resolve().parent / "results" / timestamp
@@ -694,6 +765,7 @@ def main():
                 data_path=args.data_path,
                 output_dir=sub_output_dir,
                 timestamp=timestamp,
+                skip_flipped=args.skip_flipped,
             )
 
     if args.report:

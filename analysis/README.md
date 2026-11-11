@@ -50,10 +50,15 @@ python run_analysis.py \
   --max-budget 0.20 \
   --budget-steps 20 \
   --seed 42 \
+  --skip-flipped \
   --report
 ```
 
 *Note: Adding `--report` (or `--visualize`) automatically generates an interactive HTML dashboard in the results directory.*
+
+#### Performance Acceleration (`--skip-flipped`):
+- `--skip-flipped` (aliases: `--skip-if-flipped`, `--early-stop`, `--no-skip-flipped`):
+  When enabled, any sample that already flipped detection (`perturbed_pred != 1`) in an earlier budget step is skipped in all subsequent budget steps. Because adversarial algorithms stop running once they flip the detector, re-attacking already-evaded samples at larger budgets is redundant; skipping them reuses their flipped state and drastically accelerates degradation curve generation.
 
 ### What it does:
 1. Loads a random sample of malicious texts from the dataset.
