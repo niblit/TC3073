@@ -719,9 +719,12 @@ def run_single_analysis(
         "timestamp": timestamp,
         "detector_key": f"{det_key}_{att_key}",
         "detector_display_name": f"{det_spec['display_name']} - {att_spec['display_name']}",
+        "base_detector_key": det_key,
+        "base_detector_display_name": det_spec["display_name"],
         "model_path": str(resolved_model_path),
         "attacker_key": att_key,
         "attacker_display_name": att_spec["display_name"],
+        "attacker_category": att_spec.get("category", "unknown"),
         "num_samples_requested": num_samples,
         "num_samples_valid": num_valid,
         "seed": seed,
@@ -964,14 +967,22 @@ def main():
 
     if args.report:
         try:
-            from visualize_results import resolve_results_directory, load_detector_run, build_html_report
+            from visualize_results import (
+                resolve_results_directory,
+                load_detector_run,
+                build_html_report,
+                generate_summary_tables,
+            )
             target_dir = base_results_dir
             base_dir, detector_dirs = resolve_results_directory(str(target_dir))
             data = [load_detector_run(d) for d in detector_dirs]
             html_content = build_html_report(f"Degradation Analysis ({timestamp})", base_dir, data)
             report_file = base_dir / "report.html"
             report_file.write_text(html_content, encoding="utf-8")
-            print(f"\n[REPORT] Interactive HTML report created: {report_file}")
+            summary_txt, summary_csv = generate_summary_tables(base_dir, data)
+            print(f"\n{summary_txt}")
+            print(f"[REPORT] Interactive HTML report created: {report_file}")
+            print(f"[REPORT] Summary text & CSV tables saved in: {base_dir}")
         except Exception as e:
             import traceback
             print(f"\n[WARNING] Could not auto-generate report: {e}")

@@ -518,3 +518,133 @@ def test_word_ranking_precomputed_once_and_shared_across_steps_and_attackers(tmp
             cfg = json.load(f)
         assert cfg["word_ranking"] is True
         assert cfg["parallel"] is True
+
+
+def test_visualize_results_2d_matrix_and_html_report(tmp_path):
+    """
+    Verify that load_detector_run, generate_summary_tables, and build_html_report
+    accurately parse multi-detector x multi-attacker runs, rank attacks by mean evasion,
+    produce summary_matrix.csv + summary_table.txt, and embed 2D matrix metadata in HTML.
+    """
+    from visualize_results import (
+        _infer_detector_and_attacker,
+        load_detector_run,
+        generate_summary_tables,
+        build_html_report,
+    )
+
+    # 1. Test _infer_detector_and_attacker on legacy folder names (without base_detector_key)
+    inferred = _infer_detector_and_attacker(
+        {
+            "detector_key": "char_cnn_html_tag",
+            "detector_display_name": "CharCNN - HTML Tag Injection Attack",
+            "attacker_key": "html_tag",
+            "attacker_display_name": "HTML Tag Injection Attack",
+        },
+        "char_cnn_html_tag",
+    )
+    assert inferred["detector_id"] == "char_cnn"
+    assert inferred["detector_label"] == "CharCNN"
+    assert inferred["attacker_id"] == "html_tag"
+    assert inferred["attacker_label"] == "HTML Tag Injection Attack"
+    assert inferred["attack_category"] == "structure"
+
+    # 2. Create synthetic 2 detectors x 2 attacks benchmark directory
+    combos = [
+        ("logistic_regression", "Logistic Regression (TF-IDF)", "html_tag", "HTML Tag Injection Attack", 0.2, 0.45),
+        ("transformer", "Transformer (DistilBERT)", "html_tag", "HTML Tag Injection Attack", 0.0, 0.65),
+        ("logistic_regression", "Logistic Regression (TF-IDF)", "sender_header", "Sender Header Attack", 1.0, 0.03),
+        ("transformer", "Transformer (DistilBERT)", "sender_header", "Sender Header Attack", 0.9, 0.05),
+    ]
+
+    loaded_runs = []
+    for d_key, d_name, a_key, a_name, det_rate, conf_drop in combos:
+        folder = tmp_path / f"{d_key}_{a_key}"
+        folder.mkdir(parents=True, exist_ok=True)
+
+        (folder / "run_config.json").write_text(json.dumps({
+            "timestamp": "20261111-160144",
+            "detector_key": f"{d_key}_{a_key}",
+            "detector_display_name": f"{d_name} - {a_name}",
+            "attacker_key": a_key,
+            "attacker_display_name": a_name,
+            "num_samples": 2,
+            "max_budget": 0.2,
+            "budget_steps": 1,
+            "seed": 42,
+        }), encoding="utf-8")
+
+        with open(folder / "degradation_metrics.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "budget", "num_samples", "detection_rate", "evasion_rate", "se_detection_rate",
+                "mean_orig_confidence", "mean_pert_confidence", "std_pert_confidence",
+                "mean_confidence_drop", "std_confidence_drop", "mean_real_budget_consumed", "attack_success_rate"
+            ])
+            writer.writeheader()
+            writer.writerow({
+                "budget": 0.2,
+                "num_samples": 2,
+                "detection_rate": det_rate,
+                "evasion_rate": round(1.0 - det_rate, 4),
+                "se_detection_rate": 0.0,
+                "mean_orig_confidence": 0.9,
+                "mean_pert_confidence": round(0.9 - conf_drop, 4),
+                "std_pert_confidence": 0.05,
+                "mean_confidence_drop": conf_drop,
+                "std_confidence_drop": 0.02,
+                "mean_real_budget_consumed": 3.0,
+                "attack_success_rate": 1.0,
+            })
+
+        with open(folder / "raw_results.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                "budget", "sample_idx", "original_text", "perturbed_text",
+                "original_pred", "perturbed_pred", "original_confidence", "perturbed_confidence",
+                "confidence_drop", "evaded", "real_budget_consumed", "success"
+            ])
+            writer.writeheader()
+            for s_idx in range(2):
+                ev = 1 if (det_rate == 0.0 or (det_rate < 1.0 and s_idx == 0)) else 0
+                writer.writerow({
+                    "budget": 0.2,
+                    "sample_idx": s_idx,
+                    "original_text": "Urgent verify password",
+                    "perturbed_text": "Urgent <span>verify</span> password",
+                    "original_pred": 1,
+                    "perturbed_pred": 0 if ev else 1,
+                    "original_confidence": 0.9,
+                    "perturbed_confidence": round(0.9 - conf_drop, 4),
+                    "confidence_drop": conf_drop,
+                    "evaded": ev,
+                    "real_budget_consumed": 3,
+                    "success": True,
+                })
+
+        loaded_runs.append(load_detector_run(folder))
+
+    # 3. Verify generate_summary_tables creates ranked 2D matrix CSV & text summary
+    summary_txt, matrix_csv = generate_summary_tables(tmp_path, loaded_runs)
+    assert matrix_csv.exists()
+    assert (tmp_path / "summary_table.txt").exists()
+    assert (tmp_path / "table.txt").exists()
+    assert "HTML Tag Injection Attack" in summary_txt
+    assert "2D ATTACK × DETECTOR MATRIX" in summary_txt
+
+    with open(matrix_csv, "r", encoding="utf-8") as f:
+        matrix_rows = list(csv.DictReader(f))
+    assert len(matrix_rows) == 2
+    # Rank 1 should be html_tag (90% mean evasion) over sender_header (5% mean evasion)
+    assert matrix_rows[0]["attacker_key"] == "html_tag"
+    assert float(matrix_rows[0]["mean_evasion_pct"]) == 90.0
+    assert matrix_rows[1]["attacker_key"] == "sender_header"
+    assert float(matrix_rows[1]["mean_evasion_pct"]) == 5.0
+
+    # 4. Verify build_html_report includes multi-detector and multi-attacker metadata
+    html_out = build_html_report("Test Benchmark Matrix", tmp_path, loaded_runs)
+    assert "2 Attack Algorithms" in html_out
+    assert "2 Models (Logistic Regression (TF-IDF), Transformer (DistilBERT))" in html_out
+    assert "2D Attack &times; Detector Effectiveness Matrix" in html_out
+    assert '"detector_id": "logistic_regression"' in html_out
+    assert '"attacker_id": "html_tag"' in html_out
+    assert '"attack_category": "structure"' in html_out
+

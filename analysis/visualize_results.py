@@ -150,6 +150,78 @@ def resolve_results_directory(path_str: str) -> tuple[Path, list[Path]]:
     raise ValueError(f"No benchmark results (raw_results.csv) found under {p}")
 
 
+ATTACK_CATEGORY_MAP = {
+    "textfooler": "content",
+    "zero_width": "structure",
+    "html_tag": "structure",
+    "html_entity": "structure",
+    "dom_wrapper": "structure",
+    "homoglyph": "structure",
+    "html_comment": "structure",
+    "sender_header": "metadata",
+    "auth_results": "metadata",
+    "received_routing": "metadata",
+    "x_header": "metadata",
+    "subject_metadata": "metadata",
+    "timestamp": "metadata",
+}
+
+KNOWN_DETECTORS = {
+    "logistic_regression": "Logistic Regression (TF-IDF)",
+    "char_cnn": "CharCNN",
+    "transformer": "Transformer (DistilBERT)",
+}
+
+
+def _infer_detector_and_attacker(config: dict, folder_name: str) -> dict:
+    """
+    Extracts normalized detector identity, attacker identity, and taxonomy
+    category from `run_config.json` and folder name (supporting both legacy
+    single-attacker and multi-detector × multi-attacker runs).
+    """
+    att_key = str(config.get("attacker_key", "")).strip() or "unknown"
+    att_name = str(config.get("attacker_display_name", "")).strip() or att_key.replace("_", " ").title()
+
+    base_det_key = str(config.get("base_detector_key", "")).strip()
+    base_det_name = str(config.get("base_detector_display_name", "")).strip()
+
+    raw_det_key = str(config.get("detector_key", folder_name)).strip()
+    raw_det_name = str(config.get("detector_display_name", folder_name)).strip()
+
+    if not base_det_key:
+        if att_key != "unknown" and raw_det_key.endswith(f"_{att_key}"):
+            base_det_key = raw_det_key[: -(len(att_key) + 1)]
+        else:
+            for k in KNOWN_DETECTORS:
+                if raw_det_key == k or raw_det_key.startswith(f"{k}_"):
+                    base_det_key = k
+                    if att_key == "unknown" and raw_det_key.startswith(f"{k}_"):
+                        att_key = raw_det_key[len(k) + 1 :]
+                    break
+        if not base_det_key:
+            base_det_key = raw_det_key
+
+    if not base_det_name:
+        if " - " in raw_det_name:
+            base_det_name = raw_det_name.split(" - ", 1)[0].strip()
+        elif base_det_key in KNOWN_DETECTORS:
+            base_det_name = KNOWN_DETECTORS[base_det_key]
+        else:
+            base_det_name = raw_det_name
+
+    category = str(config.get("attacker_category", "")).strip().lower()
+    if not category or category == "unknown":
+        category = ATTACK_CATEGORY_MAP.get(att_key, "other")
+
+    return {
+        "detector_id": base_det_key,
+        "detector_label": base_det_name,
+        "attacker_id": att_key,
+        "attacker_label": att_name,
+        "attack_category": category,
+    }
+
+
 def load_detector_run(detector_dir: Path) -> dict:
     """Loads all data, metrics, curves, and raw results for a single detector run."""
     print(f"Loading detector results from {detector_dir.name} ...")
@@ -174,6 +246,8 @@ def load_detector_run(detector_dir: Path) -> dict:
             "data_path": "texts.json",
             "model_path": ""
         }
+
+    identity = _infer_detector_and_attacker(config, detector_dir.name)
 
     # 2. Degradation Metrics
     metrics_file = detector_dir / "degradation_metrics.csv"
@@ -287,6 +361,11 @@ def load_detector_run(detector_dir: Path) -> dict:
     return {
         "key": config.get("detector_key", detector_dir.name),
         "name": config.get("detector_display_name", detector_dir.name.replace("_", " ").title()),
+        "detector_id": identity["detector_id"],
+        "detector_label": identity["detector_label"],
+        "attacker_id": identity["attacker_id"],
+        "attacker_label": identity["attacker_label"],
+        "attack_category": identity["attack_category"],
         "config": config,
         "metrics": metrics,
         "curve_b64": curve_b64,
@@ -308,6 +387,193 @@ def load_detector_run(detector_dir: Path) -> dict:
             "top_substitutions": top_subs
         }
     }
+
+
+def generate_summary_tables(base_dir: Path, detectors_data: list[dict]) -> tuple[str, Path]:
+    """
+    Generates a comprehensive plain-text summary report (`summary_table.txt` and `table.txt`)
+    and a 2D Attack × Detector pivot CSV (`summary_matrix.csv`) in `base_dir`.
+    Returns `(summary_text, matrix_csv_path)`.
+    """
+    # Collect unique detectors and attackers in canonical order
+    det_order = ["logistic_regression", "char_cnn", "transformer"]
+    seen_dets = {}
+    seen_atts = {}
+    grid = {}  # (att_id, det_id) -> run dict
+
+    for d in detectors_data:
+        det_id = d["detector_id"]
+        att_id = d["attacker_id"]
+        seen_dets[det_id] = d["detector_label"]
+        seen_atts[att_id] = (d["attacker_label"], d["attack_category"])
+        grid[(att_id, det_id)] = d
+
+    sorted_det_ids = sorted(
+        seen_dets.keys(),
+        key=lambda k: (det_order.index(k) if k in det_order else 99, k),
+    )
+
+    # Compute per-attacker aggregate metrics across detectors
+    attacker_stats = []
+    for att_id, (att_label, att_cat) in seen_atts.items():
+        ev_vals = []
+        det_vals = []
+        drop_vals = []
+        for det_id in sorted_det_ids:
+            run = grid.get((att_id, det_id))
+            if run:
+                ev_vals.append(run["summary"]["final_evasion_rate"])
+                det_vals.append(run["summary"]["final_detection_rate"])
+                drop_vals.append(run["summary"]["mean_confidence_drop"])
+        mean_ev = sum(ev_vals) / len(ev_vals) if ev_vals else 0.0
+        mean_det = sum(det_vals) / len(det_vals) if det_vals else 100.0
+        mean_drop = sum(drop_vals) / len(drop_vals) if drop_vals else 0.0
+        max_ev = max(ev_vals) if ev_vals else 0.0
+        attacker_stats.append({
+            "attacker_id": att_id,
+            "attacker_label": att_label,
+            "category": att_cat,
+            "mean_evasion": round(mean_ev, 1),
+            "mean_detection": round(mean_det, 1),
+            "mean_drop": round(mean_drop, 2),
+            "max_evasion": round(max_ev, 1),
+        })
+
+    # Sort attackers by mean_evasion desc, then mean_drop desc
+    attacker_stats.sort(key=lambda x: (x["mean_evasion"], x["mean_drop"]), reverse=True)
+
+    # Write summary_matrix.csv
+    matrix_csv_path = base_dir / "summary_matrix.csv"
+    csv_headers = ["rank", "attacker_key", "attacker_name", "category"]
+    for det_id in sorted_det_ids:
+        csv_headers.extend([
+            f"{det_id}_evasion_pct",
+            f"{det_id}_detection_pct",
+            f"{det_id}_conf_drop_pct",
+        ])
+    csv_headers.extend(["mean_evasion_pct", "mean_detection_pct", "mean_conf_drop_pct"])
+
+    with open(matrix_csv_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=csv_headers)
+        writer.writeheader()
+        for rank_idx, astat in enumerate(attacker_stats, start=1):
+            att_id = astat["attacker_id"]
+            row_dict = {
+                "rank": rank_idx,
+                "attacker_key": att_id,
+                "attacker_name": astat["attacker_label"],
+                "category": astat["category"],
+                "mean_evasion_pct": astat["mean_evasion"],
+                "mean_detection_pct": astat["mean_detection"],
+                "mean_conf_drop_pct": astat["mean_drop"],
+            }
+            for det_id in sorted_det_ids:
+                run = grid.get((att_id, det_id))
+                if run:
+                    row_dict[f"{det_id}_evasion_pct"] = run["summary"]["final_evasion_rate"]
+                    row_dict[f"{det_id}_detection_pct"] = run["summary"]["final_detection_rate"]
+                    row_dict[f"{det_id}_conf_drop_pct"] = run["summary"]["mean_confidence_drop"]
+                else:
+                    row_dict[f"{det_id}_evasion_pct"] = ""
+                    row_dict[f"{det_id}_detection_pct"] = ""
+                    row_dict[f"{det_id}_conf_drop_pct"] = ""
+            writer.writerow(row_dict)
+
+    # Build formatted plain-text summary report
+    lines = []
+    lines.append("=" * 110)
+    lines.append("ADVERSARIAL ROBUSTNESS BENCHMARK — EXECUTIVE SUMMARY & 2D MATRIX")
+    lines.append("=" * 110)
+
+    if attacker_stats:
+        best_ev = attacker_stats[0]
+        best_drop = max(attacker_stats, key=lambda x: x["mean_drop"])
+        lines.append(
+            f"  * Most Effective Attack (Evasion) : {best_ev['attacker_label']} [{best_ev['category'].upper()}] "
+            f"— {best_ev['mean_evasion']:.1f}% Mean Evasion (Peak: {best_ev['max_evasion']:.1f}%)"
+        )
+        lines.append(
+            f"  * Largest Confidence Drop (ΔConf) : {best_drop['attacker_label']} [{best_drop['category'].upper()}] "
+            f"— -{best_drop['mean_drop']:.2f}% Mean Confidence Drop"
+        )
+
+    # Detector averages
+    det_summaries = []
+    for det_id in sorted_det_ids:
+        det_runs = [grid[(a["attacker_id"], det_id)] for a in attacker_stats if (a["attacker_id"], det_id) in grid]
+        if det_runs:
+            avg_ev = sum(r["summary"]["final_evasion_rate"] for r in det_runs) / len(det_runs)
+            avg_det = sum(r["summary"]["final_detection_rate"] for r in det_runs) / len(det_runs)
+            avg_drp = sum(r["summary"]["mean_confidence_drop"] for r in det_runs) / len(det_runs)
+            worst_run = max(det_runs, key=lambda r: (r["summary"]["final_evasion_rate"], r["summary"]["mean_confidence_drop"]))
+            det_summaries.append((det_id, seen_dets[det_id], avg_det, avg_ev, avg_drp, worst_run))
+
+    if det_summaries:
+        lines.append("\nDETECTOR VULNERABILITY SUMMARY (Averaged Across All Evaluated Attacks):")
+        lines.append("-" * 110)
+        for _did, dlabel, avg_det, avg_ev, avg_drp, wrun in det_summaries:
+            lines.append(
+                f"  * {dlabel:28s} | Avg Retained: {avg_det:5.1f}% | Avg Evasion: {avg_ev:5.1f}% | "
+                f"Avg ΔConf: -{avg_drp:5.2f}% | Hardest Hit By: {wrun['attacker_label']} "
+                f"({wrun['summary']['final_evasion_rate']:.1f}% ev, -{wrun['summary']['mean_confidence_drop']:.1f}% Δconf)"
+            )
+
+    # 2D Matrix Table: Attack x Detector at Max Budget
+    lines.append("\n" + "=" * 110)
+    lines.append("2D ATTACK × DETECTOR MATRIX (At Max Budget — Ranked by Mean Evasion Rate)")
+    lines.append("Format per cell: Evasion% (-ΔConf%)")
+    lines.append("=" * 110)
+
+    short_det_names = {
+        "logistic_regression": "LogReg (TF-IDF)",
+        "char_cnn": "CharCNN",
+        "transformer": "Transformer",
+    }
+    header_cols = [f"{'#':>2s}", f"{'Attack Algorithm':30s}", f"{'Category':10s}"]
+    for det_id in sorted_det_ids:
+        sname = short_det_names.get(det_id, seen_dets[det_id][:18])
+        header_cols.append(f"{sname:20s}")
+    header_cols.append(f"{'Mean Evasion (ΔConf)':22s}")
+    header_line = " | ".join(header_cols)
+    lines.append(header_line)
+    lines.append("-" * len(header_line))
+
+    for rank_idx, astat in enumerate(attacker_stats, start=1):
+        att_id = astat["attacker_id"]
+        row_cols = [
+            f"{rank_idx:2d}",
+            f"{astat['attacker_label'][:30]:30s}",
+            f"{astat['category'].upper():10s}",
+        ]
+        for det_id in sorted_det_ids:
+            run = grid.get((att_id, det_id))
+            if run:
+                ev = run["summary"]["final_evasion_rate"]
+                drp = run["summary"]["mean_confidence_drop"]
+                cell_str = f"{ev:5.1f}% ({-drp:+6.2f}%)"
+            else:
+                cell_str = "N/A"
+            row_cols.append(f"{cell_str:20s}")
+        mean_str = f"{astat['mean_evasion']:5.1f}% ({-astat['mean_drop']:+6.2f}%)"
+        row_cols.append(f"{mean_str:22s}")
+        lines.append(" | ".join(row_cols))
+
+    lines.append("-" * len(header_line))
+    # Average footer row
+    avg_cols = [f"{'':2s}", f"{'DETECTOR AVERAGE':30s}", f"{'ALL':10s}"]
+    for _did, _dlabel, _avg_det, avg_ev, avg_drp, _wrun in det_summaries:
+        c_str = f"{avg_ev:5.1f}% ({-avg_drp:+6.2f}%)"
+        avg_cols.append(f"{c_str:20s}")
+    overall_ev = sum(x["mean_evasion"] for x in attacker_stats) / len(attacker_stats) if attacker_stats else 0.0
+    overall_drp = sum(x["mean_drop"] for x in attacker_stats) / len(attacker_stats) if attacker_stats else 0.0
+    avg_cols.append(f"{f'{overall_ev:5.1f}% ({-overall_drp:+6.2f}%)':22s}")
+    lines.append(" | ".join(avg_cols))
+    lines.append("=" * 110)
+
+    summary_text = "\n".join(lines) + "\n"
+    (base_dir / "summary_table.txt").write_text(summary_text, encoding="utf-8")
+    (base_dir / "table.txt").write_text(summary_text, encoding="utf-8")
+    return summary_text, matrix_csv_path
 
 
 # ---------------------------------------------------------------------------
@@ -541,53 +807,312 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       margin-top: 4px;
     }
 
-    /* Multi-Detector Model Selector Tabs */
-    .detector-nav {
+    /* Executive Insights Banner */
+    .insights-banner {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+      margin-bottom: 24px;
+    }
+    .insight-card {
+      background: linear-gradient(145deg, var(--bg-card), var(--bg-surface));
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      padding: 16px 18px;
+      box-shadow: var(--shadow-card);
+      cursor: pointer;
+      transition: transform 0.15s, border-color 0.15s;
+      position: relative;
+    }
+    .insight-card:hover {
+      border-color: var(--border-accent);
+      transform: translateY(-2px);
+    }
+    .insight-tag {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--accent-cyan);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .insight-headline {
+      font-size: 16px;
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 4px;
       display: flex;
       align-items: center;
       gap: 8px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-subtle);
-      border-radius: var(--radius-md);
-      padding: 6px;
-      margin-bottom: 24px;
-      overflow-x: auto;
+      flex-wrap: wrap;
+    }
+    .insight-detail {
+      font-size: 12px;
+      color: var(--text-muted);
+      line-height: 1.45;
     }
 
-    .detector-tab {
-      padding: 8px 16px;
-      border-radius: var(--radius-sm);
+    /* Category Badges */
+    .cat-badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 2px 7px;
+      border-radius: 4px;
+    }
+    .cat-structure {
+      background: rgba(244, 63, 94, 0.16);
+      color: #fb7185;
+      border: 1px solid rgba(244, 63, 94, 0.35);
+    }
+    .cat-content {
+      background: rgba(99, 102, 241, 0.18);
+      color: #a5b4fc;
+      border: 1px solid rgba(99, 102, 241, 0.38);
+    }
+    .cat-metadata {
+      background: rgba(245, 158, 11, 0.16);
+      color: #fcd34d;
+      border: 1px solid rgba(245, 158, 11, 0.35);
+    }
+
+    /* 2D Attack x Detector Heatmap Matrix */
+    .matrix-section {
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 22px;
+      margin-bottom: 24px;
+      box-shadow: var(--shadow-card);
+    }
+    .matrix-controls {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    .matrix-table-wrapper {
+      overflow-x: auto;
+      margin-top: 14px;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-md);
+      background: var(--bg-canvas);
+    }
+    .matrix-table {
+      width: 100%;
+      border-collapse: collapse;
       font-size: 13px;
+    }
+    .matrix-table th {
+      background: var(--bg-surface-elevated);
+      color: var(--text-muted);
+      font-weight: 700;
+      padding: 11px 14px;
+      border-bottom: 1px solid var(--border-accent);
+      border-right: 1px solid rgba(255, 255, 255, 0.04);
+      text-transform: uppercase;
+      font-size: 11px;
+      letter-spacing: 0.04em;
+      text-align: center;
+      cursor: pointer;
+      transition: background 0.15s, color 0.15s;
+    }
+    .matrix-table th:first-child,
+    .matrix-table th:nth-child(2) {
+      text-align: left;
+    }
+    .matrix-table th:hover {
+      background: #1e2c47;
+      color: #fff;
+    }
+    .matrix-table td {
+      padding: 10px 14px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+      border-right: 1px solid rgba(255, 255, 255, 0.04);
+      vertical-align: middle;
+    }
+    .matrix-attack-cell {
+      cursor: pointer;
+      font-weight: 600;
+      color: var(--text-main);
+      white-space: nowrap;
+      transition: color 0.15s;
+    }
+    .matrix-attack-cell:hover {
+      color: var(--accent-cyan);
+    }
+    .matrix-rank-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 24px;
+      height: 22px;
+      border-radius: 4px;
+      font-family: 'Fira Code', monospace;
+      font-size: 11px;
+      font-weight: 700;
+      background: var(--bg-surface);
+      color: var(--text-muted);
+      border: 1px solid var(--border-subtle);
+    }
+    .matrix-rank-badge.top-rank {
+      background: rgba(244, 63, 94, 0.2);
+      color: #fda4af;
+      border-color: rgba(244, 63, 94, 0.45);
+    }
+    .matrix-heat-cell {
+      text-align: center;
+      cursor: pointer;
+      transition: transform 0.1s, outline 0.1s, filter 0.15s;
+      position: relative;
+      min-width: 145px;
+    }
+    .matrix-heat-cell:hover {
+      outline: 2px solid #fff;
+      z-index: 5;
+      filter: brightness(1.15);
+    }
+    .matrix-heat-cell.selected-cell {
+      outline: 2px solid var(--accent-cyan);
+      box-shadow: inset 0 0 0 1px var(--accent-cyan);
+    }
+    .heat-main-val {
+      font-size: 15px;
+      font-weight: 800;
+      color: #fff;
+      font-family: 'Fira Code', monospace;
+      line-height: 1.2;
+    }
+    .heat-sub-val {
+      font-size: 11px;
+      color: rgba(241, 245, 249, 0.78);
+      margin-top: 2px;
+      font-family: 'Fira Code', monospace;
+    }
+    .matrix-footer-row td {
+      background: var(--bg-surface-elevated);
+      font-weight: 700;
+      border-top: 2px solid var(--border-accent);
+    }
+
+    /* Two-Level Dimensional Selector Bar */
+    .dimension-nav-panel {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-lg);
+      padding: 14px 18px;
+      margin-bottom: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .dim-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .dim-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-muted);
+      min-width: 90px;
+    }
+    .dim-pills {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      flex: 1;
+    }
+    .detector-tab {
+      padding: 6px 13px;
+      border-radius: var(--radius-sm);
+      font-size: 12px;
       font-weight: 600;
       color: var(--text-muted);
-      background: transparent;
-      border: none;
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px solid transparent;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
-      gap: 8px;
+      gap: 7px;
       white-space: nowrap;
       transition: all 0.15s ease;
     }
     .detector-tab:hover {
       color: #fff;
-      background: rgba(255, 255, 255, 0.04);
+      background: rgba(255, 255, 255, 0.06);
+      border-color: var(--border-subtle);
     }
     .detector-tab.active {
       background: var(--bg-card);
       color: #fff;
       box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
-      border: 1px solid var(--border-accent);
+      border: 1px solid var(--accent-primary);
     }
     .detector-tab-badge {
-      font-size: 11px;
-      padding: 2px 6px;
+      font-size: 10px;
+      padding: 1px 6px;
       border-radius: 10px;
       background: rgba(255, 255, 255, 0.08);
+      font-family: 'Fira Code', monospace;
     }
     .detector-tab.active .detector-tab-badge {
       background: var(--accent-primary);
       color: #fff;
+    }
+    .active-slice-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 8px;
+      border-top: 1px solid var(--border-subtle);
+      font-size: 12px;
+      color: var(--text-muted);
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    /* Interactive Chart Legend */
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border-subtle);
+    }
+    .legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 4px 10px;
+      border-radius: var(--radius-sm);
+      background: var(--bg-surface);
+      border: 1px solid var(--border-subtle);
+      font-size: 12px;
+      color: var(--text-main);
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .legend-item:hover {
+      border-color: var(--border-accent);
+      background: var(--bg-surface-elevated);
+    }
+    .legend-swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 3px;
+      display: inline-block;
     }
 
     /* Multi-Detector Comparison Matrix */
@@ -1312,14 +1837,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       </div>
 
       <div class="header-meta">
-        <span class="meta-tag">Attacker: <strong>__ATTACKER_NAME__</strong></span>
+        <span class="meta-tag">Detectors: <strong>__DETECTOR_SUMMARY__</strong></span>
+        <span class="meta-tag">Attacks: <strong>__ATTACKER_NAME__</strong></span>
+        <span class="meta-tag">Runs: <strong>__RUN_COUNT__</strong></span>
         <span class="meta-tag">Timestamp: <strong>__TIMESTAMP__</strong></span>
         <span class="meta-tag">Max Budget: <strong>__MAX_BUDGET_PCT__% (__BUDGET_STEPS__ steps)</strong></span>
         <span class="meta-tag">Seed: <strong>__SEED__</strong></span>
       </div>
 
       <div class="header-actions">
-        <button class="btn btn-primary" onclick="exportFilteredData('csv')">Export CSV</button>
+        <button class="btn btn-primary" onclick="exportMatrixCSV()">Export 2D Matrix CSV</button>
+        <button class="btn" onclick="exportFilteredData('csv')">Export Iterations CSV</button>
         <button class="btn" onclick="exportFilteredData('json')">Export JSON</button>
       </div>
     </div>
@@ -1327,33 +1855,106 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <div class="container">
 
-    <!-- KPI Summary Grid -->
-    <section class="kpi-grid" id="kpiGrid">
-      <!-- Injected via JavaScript based on selected detector or aggregate -->
+    <!-- Executive Insights Banner (Most effective attack, strongest confidence drop, detector comparison, category breakdown) -->
+    <section class="insights-banner" id="insightsBanner" style="display: none;">
+      <!-- Injected via JavaScript -->
     </section>
 
-    <!-- Multi-Detector Model Selector Tabs -->
-    <nav class="detector-nav" id="detectorNav">
-      <!-- Tabs injected via JavaScript -->
+    <!-- 2D Attack x Detector Heatmap Matrix (Shown when multiple runs exist) -->
+    <section class="matrix-section" id="matrixSection" style="display: none;">
+      <div class="section-header" style="flex-wrap: wrap; gap: 12px;">
+        <div>
+          <h2 class="section-title">2D Attack &times; Detector Effectiveness Matrix</h2>
+          <p class="kpi-subtext">At-a-glance comparison across all evaluated attack algorithms and detectors. Click any cell to drill into that exact (Detector, Attack) run, or click row/column headers to slice by Attack or Detector.</p>
+        </div>
+        <div class="matrix-controls">
+          <select id="matrixMetricSelect" class="filter-select" onchange="renderMatrix()" title="Select metric displayed in heatmap cells">
+            <option value="combined">Cell View: Evasion % + &Delta;Conf Drop %</option>
+            <option value="evasion">Cell View: Evasion Rate (%)</option>
+            <option value="detection">Cell View: Detection Retained (%)</option>
+            <option value="drop">Cell View: Mean Confidence Drop (-&Delta;%)</option>
+            <option value="flip">Cell View: Avg Flip Budget (%)</option>
+          </select>
+
+          <select id="matrixBudgetSelect" class="filter-select" onchange="renderMatrix()" title="Inspect matrix at a specific perturbation budget">
+            <option value="max">Budget: Max (__MAX_BUDGET_PCT__%)</option>
+          </select>
+
+          <select id="matrixCategorySelect" class="filter-select" onchange="renderMatrix()" title="Filter rows by attack taxonomy category">
+            <option value="all">Category: All Types</option>
+            <option value="structure">Structure Attacks</option>
+            <option value="content">Content Attacks</option>
+            <option value="metadata">Metadata Attacks</option>
+          </select>
+
+          <select id="matrixSortSelect" class="filter-select" onchange="renderMatrix()" title="Sort attack rows">
+            <option value="evasion_desc">Sort: Mean Evasion (High &rarr; Low)</option>
+            <option value="drop_desc">Sort: Mean &Delta;Conf Drop (High &rarr; Low)</option>
+            <option value="category">Sort: Attack Category</option>
+            <option value="name_asc">Sort: Attack Name (A &rarr; Z)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="matrix-table-wrapper">
+        <table class="matrix-table" id="matrixTable">
+          <thead id="matrixThead"></thead>
+          <tbody id="matrixTbody"></tbody>
+          <tfoot id="matrixTfoot"></tfoot>
+        </table>
+      </div>
+    </section>
+
+    <!-- Two-Level Dimensional Navigation Bar (Detector Filter + Attack Filter) -->
+    <nav class="dimension-nav-panel" id="detectorNav">
+      <div class="dim-row" id="detectorRow">
+        <span class="dim-label">1. Detector:</span>
+        <div class="dim-pills" id="detectorPills"></div>
+      </div>
+      <div class="dim-row" id="attackerRow">
+        <span class="dim-label">2. Attack:</span>
+        <div class="dim-pills" id="attackerPills"></div>
+      </div>
+      <div class="active-slice-bar" id="activeSliceBar">
+        <div id="activeSliceText">Viewing: <strong>All Detectors</strong> &times; <strong>All Attacks</strong></div>
+        <button class="btn" id="btnResetSlice" style="padding: 3px 10px; font-size: 11px; display: none;" onclick="selectSlice('all', 'all')">Reset to Global Overview (All &times; All)</button>
+      </div>
     </nav>
 
-    <!-- Multi-Detector Comparison Section (Shown if multiple detectors) -->
+    <!-- KPI Summary Grid -->
+    <section class="kpi-grid" id="kpiGrid">
+      <!-- Injected via JavaScript based on selected detector/attack slice -->
+    </section>
+
+    <!-- Context-Aware Leaderboard & Robustness Comparison Table -->
     <section class="comparison-section" id="comparisonSection">
-      <div class="section-header">
-        <h2 class="section-title">Detector Robustness Comparison Matrix</h2>
-        <span class="meta-tag">Evaluating resistance across __BUDGET_STEPS__ perturbation budget levels</span>
+      <div class="section-header" style="flex-wrap: wrap; gap: 10px;">
+        <div>
+          <h2 class="section-title" id="comparisonTitle">Attack &amp; Detector Robustness Leaderboard</h2>
+          <p class="kpi-subtext" id="comparisonSubtitle">Ranked by Evasion Rate (%) and Mean Confidence Drop (-&Delta;%) across __BUDGET_STEPS__ perturbation budget levels</p>
+        </div>
+        <div style="display: flex; gap: 8px; align-items: center;">
+          <select id="comparisonGroupSelect" class="filter-select" style="padding: 5px 10px; font-size: 12px;" onchange="renderComparisonTable()">
+            <option value="auto">Group: Auto (By Active Selection)</option>
+            <option value="by_attack">Group by Attack (Mean Across Detectors)</option>
+            <option value="by_detector">Group by Detector (Mean Across Attacks)</option>
+            <option value="all_runs">Show All Individual Runs (__RUN_COUNT__)</option>
+          </select>
+        </div>
       </div>
       <div class="comparison-table-wrapper">
         <table class="data-table" id="comparisonTable">
-          <thead>
+          <thead id="comparisonTableHead">
             <tr>
-              <th>Detector Model</th>
+              <th>#</th>
+              <th>Model / Attack</th>
+              <th>Category</th>
               <th>Clean Acc.</th>
               <th>Degraded Acc.</th>
-              <th>Overall Evasion</th>
+              <th>Evasion Rate</th>
               <th>Resilient Samples</th>
               <th>Mean Conf. Drop</th>
-              <th>Avg Budget Consumed</th>
+              <th>Avg Edits</th>
               <th>Avg Flip Budget</th>
             </tr>
           </thead>
@@ -1366,12 +1967,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- Interactive Degradation Curve Chart Card -->
     <section class="chart-card">
-      <div class="section-header">
+      <div class="section-header" style="flex-wrap: wrap; gap: 12px;">
         <div>
           <h2 class="section-title" id="chartTitle">Degradation Curve Analysis</h2>
           <p class="kpi-subtext" id="chartSubtitle">Detection Rate (%) and Mean Malicious Confidence (%) vs Perturbation Budget (%)</p>
         </div>
         <div class="chart-toolbar">
+          <select id="chartSeriesMode" class="filter-select" style="padding: 5px 10px; font-size: 12px;" onchange="renderChart()">
+            <option value="auto">Curves: Auto (Best for Selection)</option>
+            <option value="by_detector">Compare Detectors (Mean Across Selected Attacks)</option>
+            <option value="by_category">Compare Attack Categories (Structure vs Content vs Metadata)</option>
+            <option value="top_attacks">Top 6 Most Effective Attacks</option>
+            <option value="active_attacks">All Attacks with Impact (&gt;0% Evasion/Drop)</option>
+            <option value="all_runs">All Selected Runs</option>
+          </select>
+
+          <select id="chartMetricMode" class="filter-select" style="padding: 5px 10px; font-size: 12px;" onchange="renderChart()">
+            <option value="detection">Y-Axis: Detection Rate (%)</option>
+            <option value="evasion">Y-Axis: Evasion Rate (%)</option>
+            <option value="confidence">Y-Axis: Mean Malicious Confidence (%)</option>
+          </select>
+
           <div class="chart-view-toggle">
             <button class="chart-toggle-btn active" id="btnChartDynamic" onclick="setChartMode('interactive')">Interactive Plot</button>
             <button class="chart-toggle-btn" id="btnChartImage" onclick="setChartMode('image')">Saved Matplotlib PNG</button>
@@ -1384,6 +2000,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div id="chartTooltip" class="chart-tooltip"></div>
       </div>
 
+      <div id="chartLegend" class="chart-legend"></div>
+
       <div id="imageChartWrapper" style="display: none; text-align: center; margin-top: 14px;">
         <img id="staticChartImg" src="" alt="Degradation Curve" style="max-width: 100%; border-radius: var(--radius-sm); border: 1px solid var(--border-subtle);">
       </div>
@@ -1391,12 +2009,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
     <!-- Sample Trajectory Heatmap Grid -->
     <section class="timeline-card">
-      <div class="section-header">
+      <div class="section-header" style="flex-wrap: wrap; gap: 12px;">
         <div>
           <h2 class="section-title">Sample Evasion Progression Timeline</h2>
-          <p class="kpi-subtext">Interactive matrix of sample evasion status across budget steps. Top row displays budget percentages directly without hovering. Click any cell to jump to its diff.</p>
+          <p class="kpi-subtext" id="timelineSubtitle">Interactive matrix of sample evasion status across budget steps. Click any cell to jump to its diff.</p>
         </div>
         <div class="timeline-toolbar">
+          <div style="display: flex; align-items: center; gap: 6px;">
+            <span style="font-size: 11px; color: var(--text-muted); font-weight: 600;">Run:</span>
+            <select id="timelineRunSelect" class="filter-select" style="padding: 4px 10px; font-size: 12px;" onchange="onTimelineRunChange(this.value)">
+              <!-- Populated via JS -->
+            </select>
+          </div>
           <div class="timeline-density-toggle">
             <span style="color:var(--text-dim); font-size:11px; margin: 0 4px;">Zoom:</span>
             <button class="density-btn" id="btnZoomCompact" onclick="setTimelineDensity('compact')">Compact</button>
@@ -1429,7 +2053,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <!-- Text Search -->
         <div class="search-box">
           <span class="search-icon">&#128269;</span>
-          <input type="text" id="searchInput" class="search-input" placeholder="Search original or perturbed text, substitutions, keywords..." oninput="handleSearchInput()">
+          <input type="text" id="searchInput" class="search-input" placeholder="Search original or perturbed text, substitutions, detector, attack..." oninput="handleSearchInput()">
         </div>
 
         <!-- Outcome Filter -->
@@ -1463,11 +2087,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         <!-- Sort By -->
         <select id="sortSelect" class="filter-select" onchange="applyFilters()">
-          <option value="default">Sort: Sample ID & Budget</option>
+          <option value="evaded_first">Sort: Evaded &amp; Largest Drop First</option>
           <option value="drop_desc">Sort: Largest Confidence Drop (&darr;)</option>
           <option value="conf_asc">Sort: Lowest Perturbed Confidence (&uarr;)</option>
           <option value="edits_desc">Sort: Most Words Modified (&darr;)</option>
-          <option value="evaded_first">Sort: Evaded First</option>
+          <option value="default">Sort: Sample ID &amp; Budget</option>
         </select>
 
         <!-- Diff Mode Switcher -->
@@ -1485,7 +2109,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           (<strong id="lblEvadedCount">0</strong> label flips, <span id="lblResistedCount">0</span> resisted).
         </div>
         <div style="display: flex; gap: 10px;">
-          <button class="btn" style="padding: 4px 8px; font-size: 11px;" onclick="resetFilters()">Reset Filters</button>
+          <button class="btn" style="padding: 4px 8px; font-size: 11px;" onclick="resetFilters()">Reset Sample Filters</button>
         </div>
       </div>
     </section>
@@ -1528,21 +2152,39 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
   <!-- Client-Side Dashboard Application Script -->
   <script>
-    // State
-    let currentDetectorIdx = 0; // Index in BENCHMARK_DATA
-    let isMultiView = false;
+    // -------------------------------------------------------------------------
+    // Global State & Indexed Metadata
+    // -------------------------------------------------------------------------
+    let selectedDetectorId = 'all'; // 'all' or specific detector_id
+    let selectedAttackerId = 'all'; // 'all' or specific attacker_id
+    let selectedTimelineRunKey = null; // key of run displayed in Sample Progression Timeline
     let globalDiffMode = 'unified'; // 'unified' | 'split' | 'subs' | 'patch'
     let chartViewMode = 'interactive'; // 'interactive' | 'image'
     let currentPage = 1;
     const pageSize = 15;
 
     let filteredRows = [];
+    let uniqueDetectors = []; // [{ id, label }]
+    let uniqueAttackers = []; // [{ id, label, category, meanEvasion, meanDrop }]
+    let runGrid = {}; // `${att_id}__${det_id}` -> run object
 
-    // Initialize application on load
+    const DETECTOR_ORDER = ['logistic_regression', 'char_cnn', 'transformer'];
+    const SERIES_PALETTE = [
+      '#f43f5e', '#06b6d4', '#10b981', '#f59e0b', '#a855f7',
+      '#3b82f6', '#ec4899', '#84cc16', '#14b8a6', '#eab308',
+      '#6366f1', '#f97316', '#64748b'
+    ];
+
     window.addEventListener('DOMContentLoaded', () => {
-      initDetectorNav();
+      buildDimensionIndices();
       initFilterDropdowns();
-      switchDetector(0);
+      initMatrixControls();
+      renderInsightsBanner();
+      if (BENCHMARK_DATA.length === 1) {
+        selectedDetectorId = BENCHMARK_DATA[0].detector_id;
+        selectedAttackerId = BENCHMARK_DATA[0].attacker_id;
+      }
+      selectSlice(selectedDetectorId, selectedAttackerId, false);
       setupCanvasResizing();
     });
 
@@ -1553,110 +2195,557 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       setTimeout(() => toast.classList.remove('show'), 2200);
     }
 
-    // Model Navigation Tabs
-    function initDetectorNav() {
-      const nav = document.getElementById('detectorNav');
-      nav.innerHTML = '';
+    function catBadgeHtml(cat) {
+      const c = (cat || 'content').toLowerCase();
+      return `<span class="cat-badge cat-${c}">${escapeHtml(c)}</span>`;
+    }
 
-      if (BENCHMARK_DATA.length > 1) {
-        const allTab = document.createElement('button');
-        allTab.className = 'detector-tab' + (isMultiView ? ' active' : '');
-        allTab.innerHTML = `All Detectors Comparison <span class="detector-tab-badge">${BENCHMARK_DATA.length} Models</span>`;
-        allTab.onclick = () => switchDetector(-1);
-        nav.appendChild(allTab);
-      }
+    // Build indices for Detectors, Attackers, and 2D Grid
+    function buildDimensionIndices() {
+      const detMap = new Map();
+      const attMap = new Map();
+      runGrid = {};
 
-      BENCHMARK_DATA.forEach((det, idx) => {
-        const btn = document.createElement('button');
-        btn.className = 'detector-tab' + (!isMultiView && currentDetectorIdx === idx ? ' active' : '');
-        btn.innerHTML = `${det.name} <span class="detector-tab-badge">${det.summary.final_detection_rate}% Retained</span>`;
-        btn.onclick = () => switchDetector(idx);
-        nav.appendChild(btn);
+      BENCHMARK_DATA.forEach(d => {
+        const detId = d.detector_id || d.key;
+        const detLabel = d.detector_label || d.name;
+        const attId = d.attacker_id || 'textfooler';
+        const attLabel = d.attacker_label || 'TextFooler';
+        const attCat = d.attack_category || 'content';
+
+        d.detector_id = detId;
+        d.detector_label = detLabel;
+        d.attacker_id = attId;
+        d.attacker_label = attLabel;
+        d.attack_category = attCat;
+
+        detMap.set(detId, detLabel);
+        if (!attMap.has(attId)) {
+          attMap.set(attId, { id: attId, label: attLabel, category: attCat, runs: [] });
+        }
+        attMap.get(attId).runs.push(d);
+        runGrid[`${attId}__${detId}`] = d;
+      });
+
+      uniqueDetectors = Array.from(detMap.entries())
+        .map(([id, label]) => {
+          const runs = BENCHMARK_DATA.filter(r => r.detector_id === id);
+          const avgDet = runs.reduce((acc, r) => acc + r.summary.final_detection_rate, 0) / (runs.length || 1);
+          const avgEv = runs.reduce((acc, r) => acc + r.summary.final_evasion_rate, 0) / (runs.length || 1);
+          const avgDrop = runs.reduce((acc, r) => acc + r.summary.mean_confidence_drop, 0) / (runs.length || 1);
+          return { id, label, avgDet, avgEv, avgDrop, runs };
+        })
+        .sort((a, b) => {
+          const ia = DETECTOR_ORDER.indexOf(a.id);
+          const ib = DETECTOR_ORDER.indexOf(b.id);
+          return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib) || a.label.localeCompare(b.label);
+        });
+
+      uniqueAttackers = Array.from(attMap.values())
+        .map(a => {
+          const meanEvasion = a.runs.reduce((acc, r) => acc + r.summary.final_evasion_rate, 0) / (a.runs.length || 1);
+          const meanDrop = a.runs.reduce((acc, r) => acc + r.summary.mean_confidence_drop, 0) / (a.runs.length || 1);
+          const maxEvasion = Math.max(...a.runs.map(r => r.summary.final_evasion_rate), 0);
+          return { ...a, meanEvasion, meanDrop, maxEvasion };
+        })
+        .sort((a, b) => b.meanEvasion - a.meanEvasion || b.meanDrop - a.meanDrop || a.label.localeCompare(b.label));
+    }
+
+    function getActiveRuns() {
+      return BENCHMARK_DATA.filter(d => {
+        if (selectedDetectorId !== 'all' && d.detector_id !== selectedDetectorId) return false;
+        if (selectedAttackerId !== 'all' && d.attacker_id !== selectedAttackerId) return false;
+        return true;
       });
     }
 
-    function switchDetector(idx) {
-      if (idx === -1) {
-        isMultiView = true;
-      } else {
-        isMultiView = false;
-        currentDetectorIdx = idx;
+    // -------------------------------------------------------------------------
+    // Executive Insights Banner
+    // -------------------------------------------------------------------------
+    function renderInsightsBanner() {
+      const banner = document.getElementById('insightsBanner');
+      if (!banner) return;
+      if (BENCHMARK_DATA.length <= 1) {
+        banner.style.display = 'none';
+        return;
       }
+      banner.style.display = 'grid';
+      banner.innerHTML = '';
 
-      // Update Nav active classes
-      const tabs = document.querySelectorAll('.detector-tab');
-      tabs.forEach((tab, i) => {
-        if (isMultiView) {
-          tab.classList.toggle('active', i === 0);
-        } else {
-          tab.classList.toggle('active', i === (BENCHMARK_DATA.length > 1 ? idx + 1 : idx));
+      // 1. Most Effective Attack (by Mean Evasion)
+      const topAttack = uniqueAttackers[0];
+      const bestRunForTop = [...topAttack.runs].sort((a, b) => b.summary.final_evasion_rate - a.summary.final_evasion_rate)[0];
+
+      // 2. Strongest Confidence Eroder
+      const topDropAttack = [...uniqueAttackers].sort((a, b) => b.meanDrop - a.meanDrop)[0];
+      const bestDropRun = [...topDropAttack.runs].sort((a, b) => b.summary.mean_confidence_drop - a.summary.mean_confidence_drop)[0];
+
+      // 3. Detector Vulnerability Comparison
+      const sortedDetsByVuln = [...uniqueDetectors].sort((a, b) => b.avgEv - a.avgEv || b.avgDrop - a.avgDrop);
+      const mostVulnDet = sortedDetsByVuln[0];
+      const mostResDet = sortedDetsByVuln[sortedDetsByVuln.length - 1];
+
+      // 4. Category Breakdown
+      const categories = ['structure', 'content', 'metadata'];
+      const catStats = categories.map(cat => {
+        const catRuns = BENCHMARK_DATA.filter(r => r.attack_category === cat);
+        const avgEv = catRuns.length ? (catRuns.reduce((s, r) => s + r.summary.final_evasion_rate, 0) / catRuns.length) : 0;
+        const avgDrp = catRuns.length ? (catRuns.reduce((s, r) => s + r.summary.mean_confidence_drop, 0) / catRuns.length) : 0;
+        return { cat, avgEv, avgDrp, count: catRuns.length };
+      }).filter(c => c.count > 0).sort((a, b) => b.avgEv - a.avgEv);
+
+      const topCat = catStats[0];
+
+      const insightCards = [
+        {
+          tag: 'Most Effective Attack (Label Flips)',
+          badge: catBadgeHtml(topAttack.category),
+          headline: `${escapeHtml(topAttack.label)} — ${topAttack.meanEvasion.toFixed(1)}% Mean Evasion`,
+          detail: `Peaks at <strong>${bestRunForTop.summary.final_evasion_rate.toFixed(1)}%</strong> evasion against <strong>${escapeHtml(bestRunForTop.detector_label)}</strong> (-${bestRunForTop.summary.mean_confidence_drop.toFixed(1)}% &Delta;conf). Click to inspect.`,
+          onClick: () => selectSlice('all', topAttack.id, true)
+        },
+        {
+          tag: 'Strongest Confidence Erosion (&Delta;Conf)',
+          badge: catBadgeHtml(topDropAttack.category),
+          headline: `${escapeHtml(topDropAttack.label)} — -${topDropAttack.meanDrop.toFixed(1)}% Mean Drop`,
+          detail: `Causes up to <strong>-${bestDropRun.summary.mean_confidence_drop.toFixed(1)}%</strong> confidence drop on <strong>${escapeHtml(bestDropRun.detector_label)}</strong>. Click to inspect.`,
+          onClick: () => selectSlice('all', topDropAttack.id, true)
+        },
+        {
+          tag: 'Detector Vulnerability Spread',
+          badge: `<span class="meta-tag" style="padding:1px 6px; font-size:10px;">${uniqueDetectors.length} Detectors</span>`,
+          headline: `${escapeHtml(mostVulnDet.label.split(' ')[0])} (${mostVulnDet.avgEv.toFixed(1)}% ev) vs ${escapeHtml(mostResDet.label.split(' ')[0])} (${mostResDet.avgEv.toFixed(1)}% ev)`,
+          detail: `Most vulnerable: <strong>${escapeHtml(mostVulnDet.label)}</strong> (${mostVulnDet.avgDet.toFixed(1)}% avg retained). Most resilient: <strong>${escapeHtml(mostResDet.label)}</strong> (${mostResDet.avgDet.toFixed(1)}% avg retained).`,
+          onClick: () => selectSlice(mostVulnDet.id, 'all', true)
+        },
+        {
+          tag: 'Attack Vector Taxonomy Impact',
+          badge: catBadgeHtml(topCat.cat),
+          headline: `${topCat.cat.toUpperCase()} Attacks Lead (${topCat.avgEv.toFixed(1)}% Avg Evasion)`,
+          detail: catStats.map(c => `<strong>${c.cat.charAt(0).toUpperCase() + c.cat.slice(1)}</strong>: ${c.avgEv.toFixed(1)}% ev (-${c.avgDrp.toFixed(1)}% &Delta;conf)`).join(' &bull; '),
+          onClick: () => {
+            const sel = document.getElementById('matrixCategorySelect');
+            if (sel) { sel.value = topCat.cat; renderMatrix(); }
+          }
         }
+      ];
+
+      insightCards.forEach(ic => {
+        const card = document.createElement('div');
+        card.className = 'insight-card';
+        card.innerHTML = `
+          <div class="insight-tag"><span>${ic.tag}</span>${ic.badge}</div>
+          <div class="insight-headline">${ic.headline}</div>
+          <div class="insight-detail">${ic.detail}</div>
+        `;
+        card.onclick = ic.onClick;
+        banner.appendChild(card);
+      });
+    }
+
+    // -------------------------------------------------------------------------
+    // 2D Attack x Detector Heatmap Matrix
+    // -------------------------------------------------------------------------
+    function initMatrixControls() {
+      const bSelect = document.getElementById('matrixBudgetSelect');
+      if (!bSelect || BENCHMARK_DATA.length === 0) return;
+      const budgets = BENCHMARK_DATA[0].metrics.map(m => m.budget);
+      const maxPct = Math.round((budgets[budgets.length - 1] || 0.2) * 100);
+      bSelect.innerHTML = `<option value="max">Budget: Max (${maxPct}%)</option>`;
+      budgets.forEach((b, idx) => {
+        const pct = Math.round(b * 100);
+        const opt = document.createElement('option');
+        opt.value = String(idx);
+        opt.textContent = `Budget Step ${idx + 1}: ${pct}% (${b.toFixed(2)})`;
+        bSelect.appendChild(opt);
+      });
+    }
+
+    function getRunMetricsAtBudget(run, budgetSel) {
+      if (!run) return null;
+      if (budgetSel === 'max' || !run.metrics || run.metrics.length === 0) {
+        return {
+          evasion: run.summary.final_evasion_rate,
+          detection: run.summary.final_detection_rate,
+          drop: run.summary.mean_confidence_drop,
+          flipBudget: run.summary.avg_flip_budget
+        };
+      }
+      const idx = Math.min(parseInt(budgetSel, 10) || 0, run.metrics.length - 1);
+      const m = run.metrics[idx];
+      return {
+        evasion: Number(((1.0 - m.detection_rate) * 100).toFixed(1)),
+        detection: Number((m.detection_rate * 100).toFixed(1)),
+        drop: Number((m.mean_confidence_drop * 100).toFixed(2)),
+        flipBudget: run.summary.avg_flip_budget
+      };
+    }
+
+    function computeHeatColor(metricMode, stats) {
+      if (!stats) return 'rgba(15, 23, 42, 0.5)';
+      if (metricMode === 'detection') {
+        // High detection = green, low detection = red
+        const evRatio = Math.min(1, Math.max(0, (100 - stats.detection) / 100));
+        if (evRatio < 0.05) return 'rgba(16, 185, 129, 0.14)';
+        return `rgba(244, 63, 94, ${(0.15 + evRatio * 0.55).toFixed(2)})`;
+      }
+      if (metricMode === 'drop') {
+        const ratio = Math.min(1, Math.max(0, stats.drop / 60));
+        if (stats.drop <= 0.1) return 'rgba(16, 185, 129, 0.10)';
+        return `rgba(244, 63, 94, ${(0.12 + ratio * 0.58).toFixed(2)})`;
+      }
+      // Default ('combined', 'evasion', 'flip'): color by evasion + subtle amber for confidence drop
+      const ev = stats.evasion;
+      const drp = stats.drop;
+      if (ev >= 50) {
+        const alpha = 0.32 + Math.min(0.45, ((ev - 50) / 50) * 0.40);
+        return `rgba(244, 63, 94, ${alpha.toFixed(2)})`;
+      } else if (ev > 0) {
+        const alpha = 0.18 + (ev / 50) * 0.22;
+        return `rgba(245, 158, 11, ${alpha.toFixed(2)})`;
+      } else if (drp >= 5.0) {
+        // 0% evasion but noticeable confidence erosion
+        return 'rgba(56, 189, 248, 0.14)';
+      } else {
+        return 'rgba(16, 185, 129, 0.10)';
+      }
+    }
+
+    function formatMatrixCellHtml(metricMode, stats) {
+      if (!stats) return `<div class="heat-main-val" style="color:var(--text-dim);">—</div>`;
+      if (metricMode === 'evasion') {
+        return `
+          <div class="heat-main-val" style="color:${stats.evasion > 0 ? '#fff' : 'var(--text-muted)'}">${stats.evasion.toFixed(1)}%</div>
+          <div class="heat-sub-val">Evaded</div>
+        `;
+      }
+      if (metricMode === 'detection') {
+        return `
+          <div class="heat-main-val">${stats.detection.toFixed(1)}%</div>
+          <div class="heat-sub-val">Retained</div>
+        `;
+      }
+      if (metricMode === 'drop') {
+        const sign = stats.drop > 0 ? '-' : '';
+        return `
+          <div class="heat-main-val" style="color:${stats.drop >= 5 ? '#fda4af' : 'var(--text-main)'}">${sign}${stats.drop.toFixed(1)}%</div>
+          <div class="heat-sub-val">&Delta;Conf (${stats.evasion.toFixed(0)}% ev)</div>
+        `;
+      }
+      if (metricMode === 'flip') {
+        const fb = stats.flipBudget !== null && stats.flipBudget !== undefined ? `${stats.flipBudget}%` : 'No Flips';
+        return `
+          <div class="heat-main-val">${fb}</div>
+          <div class="heat-sub-val">${stats.evasion.toFixed(1)}% Evaded</div>
+        `;
+      }
+      // 'combined' mode: Evasion % primary + ΔConf % secondary
+      const dropStr = stats.drop > 0 ? `-${stats.drop.toFixed(1)}% &Delta;conf` : `0.0% &Delta;conf`;
+      const mainColor = stats.evasion >= 50 ? '#fda4af' : (stats.evasion > 0 ? '#fde68a' : (stats.drop >= 5 ? '#7dd3fc' : '#6ee7b7'));
+      return `
+        <div class="heat-main-val" style="color:${mainColor};">${stats.evasion.toFixed(1)}% <span style="font-size:11px; font-weight:600; opacity:0.85;">ev</span></div>
+        <div class="heat-sub-val">${dropStr}</div>
+      `;
+    }
+
+    function renderMatrix() {
+      const sec = document.getElementById('matrixSection');
+      if (!sec) return;
+      if (uniqueAttackers.length <= 1 && uniqueDetectors.length <= 1) {
+        sec.style.display = 'none';
+        return;
+      }
+      sec.style.display = 'block';
+
+      const metricMode = document.getElementById('matrixMetricSelect')?.value || 'combined';
+      const budgetSel = document.getElementById('matrixBudgetSelect')?.value || 'max';
+      const catFilter = document.getElementById('matrixCategorySelect')?.value || 'all';
+      const sortMode = document.getElementById('matrixSortSelect')?.value || 'evasion_desc';
+
+      const thead = document.getElementById('matrixThead');
+      const tbody = document.getElementById('matrixTbody');
+      const tfoot = document.getElementById('matrixTfoot');
+
+      // 1. Build Header
+      let headHtml = `<tr>
+        <th style="width: 44px;" onclick="selectSlice('all', 'all', true)" title="Click to reset selection">#</th>
+        <th onclick="selectSlice('all', 'all', true)" title="Click to view all attacks">Attack Algorithm</th>
+        <th style="width: 110px;">Category</th>`;
+
+      uniqueDetectors.forEach(det => {
+        const isDetSelected = selectedDetectorId === det.id && selectedAttackerId === 'all';
+        const activeStyle = isDetSelected ? 'border-bottom: 2px solid var(--accent-cyan); color: #fff;' : '';
+        headHtml += `<th style="${activeStyle}" onclick="selectSlice('${det.id}', 'all', true)" title="Click to filter dashboard by ${escapeHtml(det.label)}">
+          ${escapeHtml(det.label)}
+          <div style="font-size:10px; font-weight:500; color:var(--accent-cyan); text-transform:none; margin-top:2px;">Click to slice column &darr;</div>
+        </th>`;
       });
 
+      headHtml += `<th style="background: rgba(99, 102, 241, 0.12); color: #c7d2fe;" onclick="selectSlice('all', 'all', true)">
+        Mean Across Detectors
+        <div style="font-size:10px; font-weight:500; color:var(--text-muted); text-transform:none; margin-top:2px;">Overall Effectiveness</div>
+      </th></tr>`;
+      thead.innerHTML = headHtml;
+
+      // 2. Compute rows for each attacker at selected budget
+      let rowsData = uniqueAttackers
+        .filter(att => catFilter === 'all' || att.category === catFilter)
+        .map(att => {
+          const cells = uniqueDetectors.map(det => {
+            const run = runGrid[`${att.id}__${det.id}`];
+            return { det, run, stats: getRunMetricsAtBudget(run, budgetSel) };
+          });
+          const validStats = cells.map(c => c.stats).filter(Boolean);
+          const meanEv = validStats.length ? validStats.reduce((s, x) => s + x.evasion, 0) / validStats.length : 0;
+          const meanDet = validStats.length ? validStats.reduce((s, x) => s + x.detection, 0) / validStats.length : 100;
+          const meanDrop = validStats.length ? validStats.reduce((s, x) => s + x.drop, 0) / validStats.length : 0;
+          const validFlips = validStats.map(x => x.flipBudget).filter(x => x !== null && x !== undefined);
+          const meanFlip = validFlips.length ? Number((validFlips.reduce((s, x) => s + x, 0) / validFlips.length).toFixed(1)) : null;
+
+          return {
+            att,
+            cells,
+            meanStats: { evasion: meanEv, detection: meanDet, drop: meanDrop, flipBudget: meanFlip }
+          };
+        });
+
+      // Sort rows
+      if (sortMode === 'evasion_desc') {
+        rowsData.sort((a, b) => b.meanStats.evasion - a.meanStats.evasion || b.meanStats.drop - a.meanStats.drop);
+      } else if (sortMode === 'drop_desc') {
+        rowsData.sort((a, b) => b.meanStats.drop - a.meanStats.drop || b.meanStats.evasion - a.meanStats.evasion);
+      } else if (sortMode === 'category') {
+        rowsData.sort((a, b) => a.att.category.localeCompare(b.att.category) || b.meanStats.evasion - a.meanStats.evasion);
+      } else if (sortMode === 'name_asc') {
+        rowsData.sort((a, b) => a.att.label.localeCompare(b.att.label));
+      }
+
+      // 3. Render Body Rows
+      tbody.innerHTML = '';
+      rowsData.forEach((rowObj, idx) => {
+        const tr = document.createElement('tr');
+        const isRowSelected = selectedAttackerId === rowObj.att.id && selectedDetectorId === 'all';
+        if (isRowSelected) {
+          tr.style.outline = '1px solid var(--accent-cyan)';
+        }
+
+        const rankNum = idx + 1;
+        const isTop = rowObj.meanStats.evasion > 0 && rankNum <= 3;
+
+        let trHtml = `
+          <td><span class="matrix-rank-badge ${isTop ? 'top-rank' : ''}">#${rankNum}</span></td>
+          <td class="matrix-attack-cell" onclick="selectSlice('all', '${rowObj.att.id}', true)" title="Click to compare all detectors under ${escapeHtml(rowObj.att.label)}">
+            ${escapeHtml(rowObj.att.label)}
+          </td>
+          <td>${catBadgeHtml(rowObj.att.category)}</td>
+        `;
+
+        rowObj.cells.forEach(c => {
+          const bg = computeHeatColor(metricMode, c.stats);
+          const isSelectedCell = (selectedDetectorId === c.det.id && selectedAttackerId === rowObj.att.id);
+          const cellClass = 'matrix-heat-cell' + (isSelectedCell ? ' selected-cell' : '');
+          const cellTitle = c.stats
+            ? `${rowObj.att.label} vs ${c.det.label}\nEvasion: ${c.stats.evasion.toFixed(1)}% | Retained: ${c.stats.detection.toFixed(1)}%\nMean Conf Drop: -${c.stats.drop.toFixed(2)}%\nClick to inspect this run`
+            : 'Run not available';
+          trHtml += `<td class="${cellClass}" style="background:${bg};" title="${escapeHtml(cellTitle)}" onclick="selectSlice('${c.det.id}', '${rowObj.att.id}', true)">
+            ${formatMatrixCellHtml(metricMode, c.stats)}
+          </td>`;
+        });
+
+        const meanBg = computeHeatColor(metricMode, rowObj.meanStats);
+        trHtml += `<td class="matrix-heat-cell" style="background:${meanBg}; border-left: 2px solid var(--border-accent);" title="Click to compare all detectors for ${escapeHtml(rowObj.att.label)}" onclick="selectSlice('all', '${rowObj.att.id}', true)">
+          ${formatMatrixCellHtml(metricMode, rowObj.meanStats)}
+        </td>`;
+
+        tr.innerHTML = trHtml;
+        tbody.appendChild(tr);
+      });
+
+      // 4. Render Footer Row (Detector Averages across visible rows)
+      if (rowsData.length > 0) {
+        let footHtml = `<tr class="matrix-footer-row">
+          <td></td>
+          <td style="color:#fff;">DETECTOR AVERAGE (${rowsData.length} Attacks)</td>
+          <td><span class="cat-badge" style="background:rgba(255,255,255,0.08); color:#cbd5e1;">MEAN</span></td>`;
+
+        uniqueDetectors.forEach((det, dIdx) => {
+          const colStats = rowsData.map(r => r.cells[dIdx].stats).filter(Boolean);
+          const avgEv = colStats.length ? colStats.reduce((s, x) => s + x.evasion, 0) / colStats.length : 0;
+          const avgDet = colStats.length ? colStats.reduce((s, x) => s + x.detection, 0) / colStats.length : 100;
+          const avgDrop = colStats.length ? colStats.reduce((s, x) => s + x.drop, 0) / colStats.length : 0;
+          const validFlips = colStats.map(x => x.flipBudget).filter(x => x !== null && x !== undefined);
+          const avgFlip = validFlips.length ? Number((validFlips.reduce((s, x) => s + x, 0) / validFlips.length).toFixed(1)) : null;
+          const aggStats = { evasion: avgEv, detection: avgDet, drop: avgDrop, flipBudget: avgFlip };
+
+          footHtml += `<td class="matrix-heat-cell" onclick="selectSlice('${det.id}', 'all', true)" title="Click to view all attacks against ${escapeHtml(det.label)}">
+            ${formatMatrixCellHtml(metricMode, aggStats)}
+          </td>`;
+        });
+
+        const allMeans = rowsData.map(r => r.meanStats);
+        const grandEv = allMeans.reduce((s, x) => s + x.evasion, 0) / allMeans.length;
+        const grandDet = allMeans.reduce((s, x) => s + x.detection, 0) / allMeans.length;
+        const grandDrop = allMeans.reduce((s, x) => s + x.drop, 0) / allMeans.length;
+        const grandFlips = allMeans.map(x => x.flipBudget).filter(x => x !== null && x !== undefined);
+        const grandFlip = grandFlips.length ? Number((grandFlips.reduce((s, x) => s + x, 0) / grandFlips.length).toFixed(1)) : null;
+
+        footHtml += `<td class="matrix-heat-cell" style="border-left: 2px solid var(--border-accent);" onclick="selectSlice('all', 'all', true)">
+          ${formatMatrixCellHtml(metricMode, { evasion: grandEv, detection: grandDet, drop: grandDrop, flipBudget: grandFlip })}
+        </td></tr>`;
+        tfoot.innerHTML = footHtml;
+      } else {
+        tfoot.innerHTML = '';
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // Two-Level Dimensional Navigation Bar (Detector + Attack Selector)
+    // -------------------------------------------------------------------------
+    function renderDimensionNav() {
+      const detPills = document.getElementById('detectorPills');
+      const attPills = document.getElementById('attackerPills');
+      const sliceText = document.getElementById('activeSliceText');
+      const resetBtn = document.getElementById('btnResetSlice');
+      if (!detPills || !attPills) return;
+
+      detPills.innerHTML = '';
+      attPills.innerHTML = '';
+
+      // 1. Detector Pills
+      if (uniqueDetectors.length > 1) {
+        const allDetBtn = document.createElement('button');
+        allDetBtn.className = 'detector-tab' + (selectedDetectorId === 'all' ? ' active' : '');
+        allDetBtn.innerHTML = `All Detectors <span class="detector-tab-badge">${uniqueDetectors.length}</span>`;
+        allDetBtn.onclick = () => selectSlice('all', selectedAttackerId, false);
+        detPills.appendChild(allDetBtn);
+      }
+
+      uniqueDetectors.forEach(det => {
+        const btn = document.createElement('button');
+        btn.className = 'detector-tab' + (selectedDetectorId === det.id ? ' active' : '');
+        btn.innerHTML = `${escapeHtml(det.label)} <span class="detector-tab-badge">${det.avgEv.toFixed(1)}% avg ev</span>`;
+        btn.onclick = () => selectSlice(det.id, selectedAttackerId, false);
+        detPills.appendChild(btn);
+      });
+
+      // 2. Attacker Pills (Sorted by effectiveness)
+      if (uniqueAttackers.length > 1) {
+        const allAttBtn = document.createElement('button');
+        allAttBtn.className = 'detector-tab' + (selectedAttackerId === 'all' ? ' active' : '');
+        allAttBtn.innerHTML = `All Attacks <span class="detector-tab-badge">${uniqueAttackers.length}</span>`;
+        allAttBtn.onclick = () => selectSlice(selectedDetectorId, 'all', false);
+        attPills.appendChild(allAttBtn);
+      }
+
+      uniqueAttackers.forEach(att => {
+        const btn = document.createElement('button');
+        btn.className = 'detector-tab' + (selectedAttackerId === att.id ? ' active' : '');
+        // If a specific detector is selected, show that detector's evasion rate on the pill badge
+        let badgeVal = `${att.meanEvasion.toFixed(0)}%`;
+        if (selectedDetectorId !== 'all') {
+          const r = runGrid[`${att.id}__${selectedDetectorId}`];
+          if (r) badgeVal = `${r.summary.final_evasion_rate.toFixed(0)}%`;
+        }
+        btn.innerHTML = `${escapeHtml(att.label)} <span class="detector-tab-badge">${badgeVal}</span>`;
+        btn.onclick = () => selectSlice(selectedDetectorId, att.id, false);
+        attPills.appendChild(btn);
+      });
+
+      // 3. Active Slice Status Bar
+      const activeRuns = getActiveRuns();
+      const detTitle = selectedDetectorId === 'all'
+        ? `All Detectors (${uniqueDetectors.length})`
+        : (uniqueDetectors.find(d => d.id === selectedDetectorId)?.label || selectedDetectorId);
+      const attTitle = selectedAttackerId === 'all'
+        ? `All Attacks (${uniqueAttackers.length})`
+        : (uniqueAttackers.find(a => a.id === selectedAttackerId)?.label || selectedAttackerId);
+
+      if (sliceText) {
+        sliceText.innerHTML = `Active Slice: <strong style="color:#fff;">${escapeHtml(detTitle)}</strong> &times; <strong style="color:var(--accent-cyan);">${escapeHtml(attTitle)}</strong> <span style="margin-left:6px; opacity:0.8;">(${activeRuns.length} run${activeRuns.length === 1 ? '' : 's'} matched)</span>`;
+      }
+      if (resetBtn) {
+        resetBtn.style.display = (selectedDetectorId !== 'all' || selectedAttackerId !== 'all') && BENCHMARK_DATA.length > 1 ? 'inline-flex' : 'none';
+      }
+    }
+
+    function selectSlice(detId, attId, scrollToDetails = false) {
+      selectedDetectorId = detId;
+      selectedAttackerId = attId;
+
+      renderMatrix();
+      renderDimensionNav();
       renderKPICards();
       renderComparisonTable();
+      populateTimelineRunSelector();
       renderTimelineGrid();
       updateStaticChartImage();
       renderChart();
       applyFilters();
+
+      if (scrollToDetails) {
+        const navEl = document.getElementById('detectorNav');
+        if (navEl) navEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
     }
 
-    // Render KPI Cards
+    // Legacy compatibility helper
+    function switchDetector(idx) {
+      if (idx === -1) {
+        selectSlice('all', 'all', false);
+      } else if (BENCHMARK_DATA[idx]) {
+        selectSlice(BENCHMARK_DATA[idx].detector_id, BENCHMARK_DATA[idx].attacker_id, false);
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // KPI Summary Cards (Context-Aware for Active Slice)
+    // -------------------------------------------------------------------------
     function renderKPICards() {
       const grid = document.getElementById('kpiGrid');
       grid.innerHTML = '';
 
-      let totalSamples, totalEvaded, overallEvasion, meanDrop, avgEdits, failedTransforms;
+      const runs = getActiveRuns();
+      if (runs.length === 0) return;
 
-      if (!isMultiView) {
-        const cur = BENCHMARK_DATA[currentDetectorIdx];
-        totalSamples = cur.summary.total_samples;
-        totalEvaded = cur.summary.total_evaded_samples;
-        overallEvasion = cur.summary.final_evasion_rate;
-        meanDrop = cur.summary.mean_confidence_drop;
-        avgEdits = cur.summary.avg_budget_consumed;
-        failedTransforms = cur.summary.total_failed_transforms;
-      } else {
-        totalSamples = BENCHMARK_DATA.reduce((acc, d) => acc + d.summary.total_samples, 0);
-        totalEvaded = BENCHMARK_DATA.reduce((acc, d) => acc + d.summary.total_evaded_samples, 0);
-        const sumEvasion = BENCHMARK_DATA.reduce((acc, d) => acc + d.summary.final_evasion_rate, 0);
-        overallEvasion = (sumEvasion / BENCHMARK_DATA.length).toFixed(1);
-        const sumDrop = BENCHMARK_DATA.reduce((acc, d) => acc + d.summary.mean_confidence_drop, 0);
-        meanDrop = (sumDrop / BENCHMARK_DATA.length).toFixed(1);
-        const sumEdits = BENCHMARK_DATA.reduce((acc, d) => acc + d.summary.avg_budget_consumed, 0);
-        avgEdits = (sumEdits / BENCHMARK_DATA.length).toFixed(1);
-        failedTransforms = BENCHMARK_DATA.reduce((acc, d) => acc + d.summary.total_failed_transforms, 0);
-      }
+      const totalSamples = runs.reduce((acc, d) => acc + d.summary.total_samples, 0);
+      const totalEvaded = runs.reduce((acc, d) => acc + d.summary.total_evaded_samples, 0);
+      const sumEvasion = runs.reduce((acc, d) => acc + d.summary.final_evasion_rate, 0);
+      const overallEvasion = (sumEvasion / runs.length).toFixed(1);
+      const sumDrop = runs.reduce((acc, d) => acc + d.summary.mean_confidence_drop, 0);
+      const meanDrop = (sumDrop / runs.length).toFixed(1);
+      const sumEdits = runs.reduce((acc, d) => acc + d.summary.avg_budget_consumed, 0);
+      const avgEdits = (sumEdits / runs.length).toFixed(1);
+      const failedTransforms = runs.reduce((acc, d) => acc + d.summary.total_failed_transforms, 0);
 
       const cards = [
         {
-          label: 'Evasion Rate (Attack Success)',
+          label: runs.length > 1 ? 'Mean Evasion Rate (Slice)' : 'Evasion Rate (Attack Success)',
           value: `${overallEvasion}%`,
-          subtext: `${totalEvaded} of ${totalSamples} samples evaded`,
+          subtext: `${totalEvaded} of ${totalSamples} sample evaluations evaded`,
           accent: 'var(--evaded-red)'
         },
         {
-          label: 'Detector Resiliency (Pass Rate)',
-          value: `${(100 - overallEvasion).toFixed(1)}%`,
-          subtext: `${totalSamples - totalEvaded} samples remained detected`,
+          label: 'Detector Resiliency (Retained)',
+          value: `${(100 - parseFloat(overallEvasion)).toFixed(1)}%`,
+          subtext: `${totalSamples - totalEvaded} sample evaluations remained caught`,
           accent: 'var(--caught-green)'
         },
         {
           label: 'Mean Confidence Drop',
           value: `-${meanDrop}%`,
-          subtext: 'Average malicious certainty erosion',
+          subtext: 'Average malicious certainty erosion at max budget',
           accent: 'var(--accent-primary)'
         },
         {
-          label: 'Avg Words Consumed',
+          label: 'Avg Perturbation Edits',
           value: `${avgEdits}`,
-          subtext: 'Adversarial word edits per email',
+          subtext: 'Modified tokens/injections at max budget',
           accent: 'var(--accent-cyan)'
         },
         {
           label: 'Failed Transformations',
           value: `${failedTransforms}`,
-          subtext: 'Budget requested but 0 edits possible',
+          subtext: 'Budget steps where 0 edits were applicable',
           accent: 'var(--text-dim)'
         }
       ];
@@ -1674,7 +2763,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
-    // Multi-Detector Comparison Table
+    // -------------------------------------------------------------------------
+    // Context-Aware Comparison / Leaderboard Table
+    // -------------------------------------------------------------------------
     function renderComparisonTable() {
       const sec = document.getElementById('comparisonSection');
       if (BENCHMARK_DATA.length <= 1) {
@@ -1683,37 +2774,205 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
       sec.style.display = 'block';
 
+      const groupSelect = document.getElementById('comparisonGroupSelect')?.value || 'auto';
+      const titleEl = document.getElementById('comparisonTitle');
+      const subEl = document.getElementById('comparisonSubtitle');
+      const thead = document.getElementById('comparisonTableHead');
       const tbody = document.getElementById('comparisonTableBody');
       tbody.innerHTML = '';
 
-      BENCHMARK_DATA.forEach((det, i) => {
+      // Determine effective grouping mode
+      let mode = groupSelect;
+      if (mode === 'auto') {
+        if (selectedAttackerId !== 'all' && selectedDetectorId === 'all') {
+          mode = 'single_attack_detectors';
+        } else if (selectedDetectorId !== 'all' && selectedAttackerId === 'all') {
+          mode = 'single_detector_attacks';
+        } else if (selectedDetectorId !== 'all' && selectedAttackerId !== 'all') {
+          mode = 'single_attack_detectors'; // Show all detectors for this attack so user can compare
+        } else {
+          mode = 'by_attack';
+        }
+      }
+
+      if (mode === 'by_attack') {
+        const attObjTitle = 'Attack Effectiveness Leaderboard (Averaged Across Detectors)';
+        if (titleEl) titleEl.textContent = attObjTitle;
+        if (subEl) subEl.textContent = 'Attacks ranked from highest to lowest Mean Evasion Rate (%) and Mean Confidence Drop (-Δ%). Click any row to focus on that attack.';
+        thead.innerHTML = `<tr>
+          <th>Rank</th>
+          <th>Attack Algorithm</th>
+          <th>Category</th>
+          <th>Mean Degraded Acc.</th>
+          <th>Mean Evasion Rate</th>
+          <th>Peak Evasion (Hardest Hit Detector)</th>
+          <th>Mean Conf. Drop</th>
+          <th>Avg Edits</th>
+        </tr>`;
+
+        uniqueAttackers.forEach((att, idx) => {
+          const runs = att.runs;
+          const meanDet = (runs.reduce((s, r) => s + r.summary.final_detection_rate, 0) / runs.length).toFixed(1);
+          const meanEv = att.meanEvasion.toFixed(1);
+          const meanDrp = att.meanDrop.toFixed(2);
+          const avgEd = (runs.reduce((s, r) => s + r.summary.avg_budget_consumed, 0) / runs.length).toFixed(1);
+          const bestRun = [...runs].sort((a, b) => b.summary.final_evasion_rate - a.summary.final_evasion_rate || b.summary.mean_confidence_drop - a.summary.mean_confidence_drop)[0];
+
+          const tr = document.createElement('tr');
+          tr.style.cursor = 'pointer';
+          if (selectedAttackerId === att.id) tr.style.background = 'rgba(99, 102, 241, 0.10)';
+          tr.innerHTML = `
+            <td><span class="matrix-rank-badge ${att.meanEvasion > 0 && idx < 3 ? 'top-rank' : ''}">#${idx + 1}</span></td>
+            <td><strong>${escapeHtml(att.label)}</strong></td>
+            <td>${catBadgeHtml(att.category)}</td>
+            <td><span style="color:${ parseFloat(meanDet) < 50 ? 'var(--evaded-red)' : 'var(--caught-green)'}; font-weight:600;">${meanDet}%</span></td>
+            <td><span class="status-badge ${att.meanEvasion >= 50 ? 'status-evaded' : (att.meanEvasion > 0 ? 'budget-badge' : 'status-caught')}">${meanEv}%</span></td>
+            <td><strong>${bestRun.summary.final_evasion_rate.toFixed(1)}%</strong> on <span style="color:var(--text-muted);">${escapeHtml(bestRun.detector_label)}</span></td>
+            <td>-${meanDrp}%</td>
+            <td>${avgEd} words</td>
+          `;
+          tr.onclick = () => selectSlice('all', att.id, false);
+          tbody.appendChild(tr);
+        });
+        return;
+      }
+
+      if (mode === 'by_detector') {
+        if (titleEl) titleEl.textContent = 'Detector Robustness Summary (Averaged Across All Attacks)';
+        if (subEl) subEl.textContent = 'Detectors ranked from most vulnerable to most resilient across all evaluated attack algorithms.';
+        thead.innerHTML = `<tr>
+          <th>Rank</th>
+          <th>Detector Model</th>
+          <th>Clean Acc.</th>
+          <th>Avg Degraded Acc.</th>
+          <th>Avg Evasion Rate</th>
+          <th>Avg Conf. Drop</th>
+          <th>Most Effective Attack Against Model</th>
+        </tr>`;
+
+        const sortedDets = [...uniqueDetectors].sort((a, b) => b.avgEv - a.avgEv || b.avgDrop - a.avgDrop);
+        sortedDets.forEach((det, idx) => {
+          const worstRun = [...det.runs].sort((a, b) => b.summary.final_evasion_rate - a.summary.final_evasion_rate || b.summary.mean_confidence_drop - a.summary.mean_confidence_drop)[0];
+          const tr = document.createElement('tr');
+          tr.style.cursor = 'pointer';
+          tr.innerHTML = `
+            <td><span class="matrix-rank-badge">#${idx + 1}</span></td>
+            <td><strong>${escapeHtml(det.label)}</strong></td>
+            <td><span style="color:var(--caught-green); font-weight:600;">100.0%</span></td>
+            <td><span style="color:${det.avgDet < 50 ? 'var(--evaded-red)' : 'var(--caught-green)'}; font-weight:600;">${det.avgDet.toFixed(1)}%</span></td>
+            <td><span class="status-badge ${det.avgEv >= 50 ? 'status-evaded' : 'status-caught'}">${det.avgEv.toFixed(1)}%</span></td>
+            <td>-${det.avgDrop.toFixed(2)}%</td>
+            <td><strong>${escapeHtml(worstRun.attacker_label)}</strong> (${worstRun.summary.final_evasion_rate.toFixed(1)}% ev, -${worstRun.summary.mean_confidence_drop.toFixed(1)}% &Delta;conf)</td>
+          `;
+          tr.onclick = () => selectSlice(det.id, 'all', false);
+          tbody.appendChild(tr);
+        });
+        return;
+      }
+
+      // Single Detector (rank all attacks) OR Single Attack (compare all detectors) OR All Runs
+      let rowsToRender = [];
+      if (mode === 'single_detector_attacks') {
+        const detObj = uniqueDetectors.find(d => d.id === selectedDetectorId);
+        if (titleEl) titleEl.textContent = `Attack Leaderboard Against ${detObj ? detObj.label : selectedDetectorId}`;
+        if (subEl) subEl.textContent = 'All evaluated attacks ranked by Evasion Rate (%) and Confidence Drop (-Δ%) against this detector.';
+        rowsToRender = BENCHMARK_DATA.filter(d => d.detector_id === selectedDetectorId);
+      } else if (mode === 'single_attack_detectors') {
+        const attObj = uniqueAttackers.find(a => a.id === selectedAttackerId);
+        if (titleEl) titleEl.textContent = `Detector Comparison Under ${attObj ? attObj.label : selectedAttackerId}`;
+        if (subEl) subEl.textContent = 'Side-by-side comparison of detector resistance against this specific attack algorithm.';
+        rowsToRender = BENCHMARK_DATA.filter(d => d.attacker_id === selectedAttackerId);
+      } else {
+        if (titleEl) titleEl.textContent = `All Individual Benchmark Runs (${BENCHMARK_DATA.length} Runs Ranked by Evasion)`;
+        if (subEl) subEl.textContent = 'Complete list of (Detector, Attack) combinations sorted from highest evasion impact to lowest.';
+        rowsToRender = [... getActiveRuns()];
+      }
+
+      rowsToRender.sort((a, b) => b.summary.final_evasion_rate - a.summary.final_evasion_rate || b.summary.mean_confidence_drop - a.summary.mean_confidence_drop);
+
+      thead.innerHTML = `<tr>
+        <th>Rank</th>
+        <th>Detector Model</th>
+        <th>Attack Algorithm</th>
+        <th>Category</th>
+        <th>Degraded Acc.</th>
+        <th>Evasion Rate</th>
+        <th>Resilient Samples</th>
+        <th>Mean Conf. Drop</th>
+        <th>Avg Edits</th>
+        <th>Avg Flip Budget</th>
+      </tr>`;
+
+      rowsToRender.forEach((det, idx) => {
         const tr = document.createElement('tr');
         const s = det.summary;
-        const cleanAcc = '100.0%';
         const degAcc = `${s.final_detection_rate}%`;
         const evRate = `${s.final_evasion_rate}%`;
         const flipStr = s.avg_flip_budget ? `${s.avg_flip_budget}% budget` : 'N/A';
+        const isCurrent = (selectedDetectorId === det.detector_id && selectedAttackerId === det.attacker_id);
+        if (isCurrent) tr.style.background = 'rgba(6, 182, 212, 0.12)';
 
         tr.innerHTML = `
-          <td><strong>${det.name}</strong></td>
-          <td><span style="color: var(--caught-green); font-weight:600;">${cleanAcc}</span></td>
+          <td><span class="matrix-rank-badge ${s.final_evasion_rate > 0 && idx < 3 ? 'top-rank' : ''}">#${idx + 1}</span></td>
+          <td><strong>${escapeHtml(det.detector_label)}</strong></td>
+          <td><strong>${escapeHtml(det.attacker_label)}</strong></td>
+          <td>${catBadgeHtml(det.attack_category)}</td>
           <td><span style="color: ${s.final_detection_rate < 50 ? 'var(--evaded-red)' : 'var(--caught-green)'}; font-weight:600;">${degAcc}</span></td>
-          <td><span class="status-badge ${s.final_evasion_rate > 50 ? 'status-evaded' : 'status-caught'}">${evRate}</span></td>
+          <td><span class="status-badge ${s.final_evasion_rate >= 50 ? 'status-evaded' : (s.final_evasion_rate > 0 ? 'budget-badge' : 'status-caught')}">${evRate}</span></td>
           <td>${s.resilient_samples} / ${s.total_samples}</td>
           <td>-${s.mean_confidence_drop}%</td>
           <td>${s.avg_budget_consumed} words</td>
           <td>${flipStr}</td>
         `;
         tr.style.cursor = 'pointer';
-        tr.onclick = () => switchDetector(i);
+        tr.onclick = () => selectSlice(det.detector_id, det.attacker_id, false);
         tbody.appendChild(tr);
       });
     }
 
-    // Timeline Progression Grid State & Renderer
+    // -------------------------------------------------------------------------
+    // Timeline Progression Grid State & Run Selector
+    // -------------------------------------------------------------------------
     let timelineDensity = 'normal'; // 'compact' | 'normal' | 'wide'
     let timelinePage = 1;
     let timelinePageSize = 50;
+
+    function populateTimelineRunSelector() {
+      const sel = document.getElementById('timelineRunSelect');
+      if (!sel) return;
+      const activeRuns = [...getActiveRuns()].sort(
+        (a, b) => b.summary.final_evasion_rate - a.summary.final_evasion_rate || b.summary.mean_confidence_drop - a.summary.mean_confidence_drop
+      );
+      sel.innerHTML = '';
+      activeRuns.forEach(r => {
+        const opt = document.createElement('option');
+        opt.value = r.key;
+        opt.textContent = `${r.detector_label} — ${r.attacker_label} (${r.summary.final_evasion_rate}% ev, -${r.summary.mean_confidence_drop}% Δconf)`;
+        sel.appendChild(opt);
+      });
+
+      if (activeRuns.length > 0) {
+        const stillValid = activeRuns.some(r => r.key === selectedTimelineRunKey);
+        if (!stillValid) {
+          selectedTimelineRunKey = activeRuns[0].key;
+        }
+        sel.value = selectedTimelineRunKey;
+      }
+    }
+
+    function onTimelineRunChange(runKey) {
+      selectedTimelineRunKey = runKey;
+      renderTimelineGrid();
+    }
+
+    function getTimelineTargetRun() {
+      const activeRuns = getActiveRuns();
+      if (selectedTimelineRunKey) {
+        const found = activeRuns.find(r => r.key === selectedTimelineRunKey) || BENCHMARK_DATA.find(r => r.key === selectedTimelineRunKey);
+        if (found) return found;
+      }
+      return activeRuns[0] || BENCHMARK_DATA[0];
+    }
 
     function setTimelineDensity(d) {
       timelineDensity = d;
@@ -1746,7 +3005,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       if (!container) return;
       container.innerHTML = '';
 
-      const det = isMultiView ? BENCHMARK_DATA[0] : BENCHMARK_DATA[currentDetectorIdx];
+      const det = getTimelineTargetRun();
+      if (!det) return;
+
+      const subEl = document.getElementById('timelineSubtitle');
+      if (subEl) {
+        subEl.innerHTML = `Showing sample progression for <strong>${escapeHtml(det.detector_label)}</strong> under <strong>${escapeHtml(det.attacker_label)}</strong> (${det.summary.final_evasion_rate}% evasion). Click any cell to jump to its diff below.`;
+      }
+
       const allSamples = Object.keys(det.sample_word_counts).map(Number).sort((a,b) => a-b);
       const budgets = det.metrics.map(m => m.budget);
 
@@ -1831,6 +3097,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           }
 
           cell.onclick = () => {
+            selectSlice(det.detector_id, det.attacker_id, false);
             document.getElementById('filterSample').value = sIdx;
             document.getElementById('filterBudget').value = b;
             applyFilters();
@@ -1847,8 +3114,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       // 3. Update Timeline Footer Controls (Pagination and stats)
       const stats = document.getElementById('timelineStats');
       const pag = document.getElementById('timelinePagination');
-      if (stats && pag) {
-        stats.innerHTML = `Showing <strong>${visibleSamples.length}</strong> of <strong>${totalSamples}</strong> samples across <strong>${budgets.length}</strong> budget steps (${(budgets[0]*100).toFixed(0)}% &rarr; ${(budgets[budgets.length-1]*100).toFixed(0)}%).`;
+      if (stats && pag && budgets.length > 0) {
+        stats.innerHTML = `Showing <strong>${visibleSamples.length}</strong> of <strong>${totalSamples}</strong> samples across <strong>${budgets.length}</strong> budget steps (${(budgets[0]*100).toFixed(0)}% &rarr; ${(budgets[budgets.length-1]*100).toFixed(0)}%) for <strong>${escapeHtml(det.detector_label)} — ${escapeHtml(det.attacker_label)}</strong>.`;
 
         pag.innerHTML = '';
         if (totalSamples > 25) {
@@ -1868,7 +3135,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       }
     }
 
-    // Filter Dropdowns
+    // -------------------------------------------------------------------------
+    // Filter Dropdowns & Sample Cards
+    // -------------------------------------------------------------------------
     function initFilterDropdowns() {
       const bSelect = document.getElementById('filterBudget');
       const sSelect = document.getElementById('filterSample');
@@ -1876,6 +3145,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       sSelect.innerHTML = '<option value="all">Sample: All Samples</option>';
 
       const sampleDet = BENCHMARK_DATA[0];
+      if (!sampleDet) return;
       sampleDet.metrics.forEach(m => {
         const opt = document.createElement('option');
         opt.value = m.budget;
@@ -1897,7 +3167,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('filterBudget').value = 'all';
       document.getElementById('filterSample').value = 'all';
       document.getElementById('filterMinDrop').value = '0';
-      document.getElementById('sortSelect').value = 'default';
+      document.getElementById('sortSelect').value = 'evaded_first';
       applyFilters();
     }
 
@@ -1905,7 +3175,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       applyFilters();
     }
 
-    // Apply Filters & Sorting
     function applyFilters() {
       const q = document.getElementById('searchInput').value.trim().toLowerCase();
       const outcome = document.getElementById('filterOutcome').value;
@@ -1914,17 +3183,21 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const minDrop = parseFloat(document.getElementById('filterMinDrop').value) || 0;
       const sortBy = document.getElementById('sortSelect').value;
 
+      const activeRuns = getActiveRuns();
       let sourceRows = [];
-      if (isMultiView) {
-        BENCHMARK_DATA.forEach(d => {
-          d.raw_rows.forEach(r => {
-            sourceRows.push({ ...r, detectorName: d.name, detectorKey: d.key });
+      activeRuns.forEach(d => {
+        d.raw_rows.forEach(r => {
+          sourceRows.push({
+            ...r,
+            detectorName: d.detector_label || d.name,
+            attackerName: d.attacker_label || '',
+            attackCategory: d.attack_category || 'content',
+            detectorKey: d.key,
+            detectorId: d.detector_id,
+            attackerId: d.attacker_id
           });
         });
-      } else {
-        const cur = BENCHMARK_DATA[currentDetectorIdx];
-        sourceRows = cur.raw_rows.map(r => ({ ...r, detectorName: cur.name, detectorKey: cur.key }));
-      }
+      });
 
       filteredRows = sourceRows.filter(r => {
         if (bFilter !== 'all' && Math.abs(r.b - parseFloat(bFilter)) > 0.0001) return false;
@@ -1936,19 +3209,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (outcome === 'failed' && r.ok) return false;
 
         if (q) {
-          // Search in substitutions
-          const subMatch = r.sb.some(s => s.orig.toLowerCase().includes(q) || s.pert.toLowerCase().includes(q));
-          if (!subMatch) {
-            // Search in diff chunks
-            const chunkMatch = r.ch.some(c => c[1].toLowerCase().includes(q) || (c[2] && c[2].toLowerCase().includes(q)));
-            if (!chunkMatch) return false;
+          const metaMatch = r.detectorName.toLowerCase().includes(q) || r.attackerName.toLowerCase().includes(q) || r.attackCategory.toLowerCase().includes(q);
+          if (!metaMatch) {
+            const subMatch = r.sb.some(s => s.orig.toLowerCase().includes(q) || s.pert.toLowerCase().includes(q));
+            if (!subMatch) {
+              const chunkMatch = r.ch.some(c => c[1].toLowerCase().includes(q) || (c[2] && c[2].toLowerCase().includes(q)));
+              if (!chunkMatch) return false;
+            }
           }
         }
 
         return true;
       });
 
-      // Sorting
       if (sortBy === 'drop_desc') {
         filteredRows.sort((a,b) => b.cd - a.cd);
       } else if (sortBy === 'conf_asc') {
@@ -1956,12 +3229,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       } else if (sortBy === 'edits_desc') {
         filteredRows.sort((a,b) => b.rc - a.rc);
       } else if (sortBy === 'evaded_first') {
-        filteredRows.sort((a,b) => b.ev - a.ev || a.s - b.s || a.b - b.b);
+        filteredRows.sort((a,b) => b.ev - a.ev || b.cd - a.cd || a.s - b.s || a.b - b.b);
       } else {
         filteredRows.sort((a,b) => a.s - b.s || a.b - b.b);
       }
 
-      // Update counters
       const evadedCount = filteredRows.filter(r => r.ev === 1).length;
       document.getElementById('lblMatchesCount').textContent = filteredRows.length;
       document.getElementById('lblTotalCount').textContent = sourceRows.length;
@@ -1973,7 +3245,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       renderPagination();
     }
 
-    // Render Sample Cards
     function renderSampleCards() {
       const list = document.getElementById('samplesList');
       list.innerHTML = '';
@@ -2019,7 +3290,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="sample-title-area">
               <span class="sample-id-badge">Sample #${r.s}</span>
               <span class="budget-badge">Budget: ${budgetPct}%</span>
-              <span class="meta-tag" style="padding: 2px 8px;"><strong>${r.detectorName}</strong></span>
+              <span class="meta-tag" style="padding: 2px 8px; cursor:pointer;" onclick="selectSlice('${r.detectorId}', 'all', false)" title="Filter by Detector">Detector: <strong>${escapeHtml(r.detectorName)}</strong></span>
+              <span class="meta-tag" style="padding: 2px 8px; cursor:pointer;" onclick="selectSlice('all', '${r.attackerId}', false)" title="Filter by Attack">Attack: <strong>${escapeHtml(r.attackerName)}</strong></span>
+              ${catBadgeHtml(r.attackCategory)}
               <span class="status-badge ${isEvaded ? 'status-evaded' : 'status-caught'}">
                 ${isEvaded ? '&#9888; EVADED (Label Flipped)' : '&#10003; CAUGHT (Defense Resisted)'}
               </span>
@@ -2159,7 +3432,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       renderSampleCards();
     }
 
-    // Pagination
     function renderPagination() {
       const bar = document.getElementById('paginationBar');
       bar.innerHTML = '';
@@ -2188,7 +3460,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       bar.appendChild(nextBtn);
     }
 
-    // Copying Utilities
     function copySampleText(rowIdx, type) {
       const r = filteredRows[rowIdx];
       let txt = '';
@@ -2202,14 +3473,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       navigator.clipboard.writeText(txt).then(() => showToast(`Copied ${type} text to clipboard!`));
     }
 
-    // Modal Inspector
     function openRawModal(rowIdx) {
       const r = filteredRows[rowIdx];
       const modal = document.getElementById('rawModal');
       const title = document.getElementById('modalTitle');
       const code = document.getElementById('modalCode');
 
-      title.textContent = `Sample #${r.s} @ Budget ${Math.round(r.b * 100)}% (${r.detectorName})`;
+      title.textContent = `Sample #${r.s} @ Budget ${Math.round(r.b * 100)}% (${r.detectorName} — ${r.attackerName})`;
       code.textContent = JSON.stringify(r, null, 2);
       modal.classList.add('active');
     }
@@ -2223,15 +3493,41 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       navigator.clipboard.writeText(txt).then(() => showToast('Raw JSON copied to clipboard!'));
     }
 
-    // Export Handler
+    function exportMatrixCSV() {
+      let headers = ['rank', 'attacker_key', 'attacker_name', 'category'];
+      uniqueDetectors.forEach(d => {
+        headers.push(`${d.id}_evasion_pct`, `${d.id}_detection_pct`, `${d.id}_conf_drop_pct`);
+      });
+      headers.push('mean_evasion_pct', 'mean_conf_drop_pct');
+      let csv = headers.join(',') + '\\n';
+
+      uniqueAttackers.forEach((att, idx) => {
+        let row = [idx + 1, `"${att.id}"`, `"${att.label}"`, `"${att.category}"`];
+        uniqueDetectors.forEach(det => {
+          const r = runGrid[`${att.id}__${det.id}`];
+          if (r) {
+            row.push(r.summary.final_evasion_rate, r.summary.final_detection_rate, r.summary.mean_confidence_drop);
+          } else {
+            row.push('', '', '');
+          }
+        });
+        row.push(att.meanEvasion.toFixed(1), att.meanDrop.toFixed(2));
+        csv += row.join(',') + '\\n';
+      });
+
+      const blob = new Blob([csv], { type: 'text/csv' });
+      downloadBlob(blob, 'adversarial_2d_matrix.csv');
+      showToast('Exported 2D Attack × Detector Matrix CSV!');
+    }
+
     function exportFilteredData(format) {
       if (format === 'json') {
         const blob = new Blob([JSON.stringify(filteredRows, null, 2)], { type: 'application/json' });
         downloadBlob(blob, 'adversarial_report_filtered.json');
       } else if (format === 'csv') {
-        let csvContent = "detector,budget,sample_idx,orig_pred,pert_pred,orig_conf,pert_conf,conf_drop,evaded,budget_consumed,success\\n";
+        let csvContent = "detector,attacker,category,budget,sample_idx,orig_pred,pert_pred,orig_conf,pert_conf,conf_drop,evaded,budget_consumed,success\\n";
         filteredRows.forEach(r => {
-          csvContent += `"${r.detectorName}",${r.b},${r.s},${r.op},${r.pp},${r.oc},${r.pc},${r.cd},${r.ev},${r.rc},${r.ok}\\n`;
+          csvContent += `"${r.detectorName}","${r.attackerName}","${r.attackCategory}",${r.b},${r.s},${r.op},${r.pp},${r.oc},${r.pc},${r.cd},${r.ev},${r.rc},${r.ok}\\n`;
         });
         const blob = new Blob([csvContent], { type: 'text/csv' });
         downloadBlob(blob, 'adversarial_report_filtered.csv');
@@ -2251,24 +3547,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     function escapeHtml(str) {
-      if (!str) return '';
-      return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      if (str === null || str === undefined) return '';
+      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
+    // -------------------------------------------------------------------------
     // Static Chart Toggle
+    // -------------------------------------------------------------------------
     function setChartMode(mode) {
       chartViewMode = mode;
       document.getElementById('btnChartDynamic').classList.toggle('active', mode === 'interactive');
       document.getElementById('btnChartImage').classList.toggle('active', mode === 'image');
       document.getElementById('interactiveChartWrapper').style.display = mode === 'interactive' ? 'block' : 'none';
+      document.getElementById('chartLegend').style.display = mode === 'interactive' ? 'flex' : 'none';
       document.getElementById('imageChartWrapper').style.display = mode === 'image' ? 'block' : 'none';
       if (mode === 'interactive') renderChart();
     }
 
     function updateStaticChartImage() {
       const img = document.getElementById('staticChartImg');
-      const det = isMultiView ? BENCHMARK_DATA[0] : BENCHMARK_DATA[currentDetectorIdx];
-      if (det.curve_b64) {
+      const det = getTimelineTargetRun();
+      if (det && det.curve_b64) {
         img.src = det.curve_b64;
         document.getElementById('btnChartImage').style.display = 'inline-block';
       } else {
@@ -2278,7 +3577,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     }
 
     // -------------------------------------------------------------------------
-    // Pure Canvas Interactive Chart Engine
+    // Pure Canvas Interactive Chart Engine (Multi-Mode + Interactive Legend)
     // -------------------------------------------------------------------------
     function setupCanvasResizing() {
       window.addEventListener('resize', () => {
@@ -2292,10 +3591,124 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
     }
 
-    let chartDataPoints = []; // Stored points for tooltip hit testing
+    let chartDataPoints = [];
+
+    function averageMetricsAcrossRuns(runs) {
+      if (!runs || runs.length === 0) return [];
+      const refMetrics = runs[0].metrics || [];
+      return refMetrics.map((m, idx) => {
+        const stepMetrics = runs.map(r => (r.metrics && r.metrics[idx]) ? r.metrics[idx] : m);
+        const detRate = stepMetrics.reduce((s, x) => s + x.detection_rate, 0) / stepMetrics.length;
+        const conf = stepMetrics.reduce((s, x) => s + x.mean_pert_confidence, 0) / stepMetrics.length;
+        const drop = stepMetrics.reduce((s, x) => s + x.mean_confidence_drop, 0) / stepMetrics.length;
+        return {
+          budget: m.budget,
+          detection_rate: detRate,
+          mean_pert_confidence: conf,
+          mean_confidence_drop: drop,
+          se_detection_rate: 0,
+          std_pert_confidence: 0
+        };
+      });
+    }
+
+    function buildChartSeries() {
+      const seriesModeSel = document.getElementById('chartSeriesMode')?.value || 'auto';
+      const activeRuns = getActiveRuns();
+      if (activeRuns.length === 0) return { isSingleRun: false, series: [] };
+
+      // Single (Detector, Attack) run selected
+      if (activeRuns.length === 1 && seriesModeSel === 'auto') {
+        return { isSingleRun: true, singleRun: activeRuns[0], series: [] };
+      }
+
+      let mode = seriesModeSel;
+      if (mode === 'auto') {
+        if (selectedDetectorId === 'all' && selectedAttackerId === 'all') {
+          mode = 'top_attacks';
+        } else if (selectedDetectorId === 'all' && selectedAttackerId !== 'all') {
+          mode = 'by_detector';
+        } else if (selectedDetectorId !== 'all' && selectedAttackerId === 'all') {
+          mode = 'top_attacks';
+        } else {
+          mode = 'all_runs';
+        }
+      }
+
+      if (mode === 'by_detector') {
+        const series = uniqueDetectors.map((det, idx) => {
+          const runs = activeRuns.filter(r => r.detector_id === det.id);
+          return {
+            label: det.label,
+            color: SERIES_PALETTE[idx % SERIES_PALETTE.length],
+            metrics: averageMetricsAcrossRuns(runs),
+            onClick: () => selectSlice(det.id, selectedAttackerId, false)
+          };
+        }).filter(s => s.metrics.length > 0);
+        return { isSingleRun: false, series };
+      }
+
+      if (mode === 'by_category') {
+        const cats = [
+          { id: 'structure', label: 'Structure Attacks', color: '#f43f5e' },
+          { id: 'content', label: 'Content Attacks', color: '#6366f1' },
+          { id: 'metadata', label: 'Metadata Attacks', color: '#f59e0b' }
+        ];
+        const series = cats.map(c => {
+          const runs = activeRuns.filter(r => r.attack_category === c.id);
+          return {
+            label: `${c.label} (${runs.length} runs)`,
+            color: c.color,
+            metrics: averageMetricsAcrossRuns(runs),
+            onClick: () => {
+              const sel = document.getElementById('matrixCategorySelect');
+              if (sel) { sel.value = c.id; renderMatrix(); }
+            }
+          };
+        }).filter(s => s.metrics.length > 0);
+        return { isSingleRun: false, series };
+      }
+
+      if (mode === 'top_attacks' || mode === 'active_attacks') {
+        const limit = mode === 'top_attacks' ? 6 : 99;
+        // Group activeRuns by attacker
+        const attGroups = uniqueAttackers.map(att => {
+          const runs = activeRuns.filter(r => r.attacker_id === att.id);
+          if (runs.length === 0) return null;
+          const avgEv = runs.reduce((s, r) => s + r.summary.final_evasion_rate, 0) / runs.length;
+          const avgDrp = runs.reduce((s, r) => s + r.summary.mean_confidence_drop, 0) / runs.length;
+          return { att, runs, avgEv, avgDrp };
+        }).filter(Boolean);
+
+        attGroups.sort((a, b) => b.avgEv - a.avgEv || b.avgDrp - a.avgDrp);
+        let chosen = mode === 'active_attacks'
+          ? attGroups.filter(g => g.avgEv > 0 || g.avgDrp > 0.5)
+          : attGroups.slice(0, limit);
+        if (chosen.length === 0) chosen = attGroups.slice(0, 5);
+
+        const series = chosen.map((g, idx) => ({
+          label: `${g.att.label} (${g.avgEv.toFixed(0)}% ev)`,
+          color: SERIES_PALETTE[idx % SERIES_PALETTE.length],
+          metrics: averageMetricsAcrossRuns(g.runs),
+          onClick: () => selectSlice(selectedDetectorId, g.att.id, false)
+        }));
+        return { isSingleRun: false, series };
+      }
+
+      // 'all_runs'
+      const sortedRuns = [...activeRuns].sort((a, b) => b.summary.final_evasion_rate - a.summary.final_evasion_rate || b.summary.mean_confidence_drop - a.summary.mean_confidence_drop);
+      const series = sortedRuns.map((r, idx) => ({
+        label: `${r.detector_label} — ${r.attacker_label} (${r.summary.final_evasion_rate}% ev)`,
+        color: SERIES_PALETTE[idx % SERIES_PALETTE.length],
+        metrics: r.metrics,
+        onClick: () => selectSlice(r.detector_id, r.attacker_id, false)
+      }));
+      return { isSingleRun: false, series };
+    }
 
     function renderChart() {
       const canvas = document.getElementById('chartCanvas');
+      const legendEl = document.getElementById('chartLegend');
       if (!canvas) return;
       const rect = canvas.getBoundingClientRect();
       const dpr = window.devicePixelRatio || 1;
@@ -2311,7 +3724,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       ctx.clearRect(0, 0, w, h);
 
-      // Margins
       const padLeft = 60;
       const padRight = 60;
       const padTop = 30;
@@ -2320,13 +3732,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const plotW = w - padLeft - padRight;
       const plotH = h - padTop - padBottom;
 
+      const yMetricMode = document.getElementById('chartMetricMode')?.value || 'detection';
+      const { isSingleRun, singleRun, series } = buildChartSeries();
+
       // Draw Grid & Axes
       ctx.strokeStyle = '#1e2c47';
       ctx.lineWidth = 1;
       ctx.font = '11px Inter, sans-serif';
       ctx.fillStyle = '#64748b';
 
-      // 5 Horizontal Grid lines (0% to 100%)
       for (let i = 0; i <= 5; i++) {
         const yVal = i * 20;
         const yPos = padTop + plotH - (i / 5) * plotH;
@@ -2336,20 +3750,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         ctx.lineTo(w - padRight, yPos);
         ctx.stroke();
 
-        // Left Label: Detection Rate (%)
         ctx.textAlign = 'right';
-        ctx.fillStyle = '#f43f5e';
+        ctx.fillStyle = isSingleRun ? '#f43f5e' : '#cbd5e1';
         ctx.fillText(`${yVal}%`, padLeft - 10, yPos + 4);
 
-        // Right Label: Confidence (%)
-        ctx.textAlign = 'left';
-        ctx.fillStyle = '#38bdf8';
-        ctx.fillText(`${yVal}%`, w - padRight + 10, yPos + 4);
+        if (isSingleRun) {
+          ctx.textAlign = 'left';
+          ctx.fillStyle = '#38bdf8';
+          ctx.fillText(`${yVal}%`, w - padRight + 10, yPos + 4);
+        }
       }
 
-      // X Axis (Perturbation Budget %)
-      const det = isMultiView ? BENCHMARK_DATA[0] : BENCHMARK_DATA[currentDetectorIdx];
-      const maxB = det.config.max_budget || 0.2;
+      const refRun = singleRun || BENCHMARK_DATA[0];
+      const maxB = refRun?.config?.max_budget || 0.2;
       const steps = 5;
 
       for (let i = 0; i <= steps; i++) {
@@ -2366,16 +3779,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         ctx.fillText(`${Math.round(bPct)}%`, xPos, padTop + plotH + 20);
       }
 
-      // X Axis Label
       ctx.fillText('Perturbation Budget (%)', padLeft + plotW / 2, h - 8);
 
       chartDataPoints = [];
+      if (legendEl) legendEl.innerHTML = '';
 
-      if (!isMultiView) {
-        // Single Detector Plot: Detection Rate + Confidence Drop + Confidence ±1σ
-        const cur = BENCHMARK_DATA[currentDetectorIdx];
+      if (isSingleRun && singleRun) {
+        const cur = singleRun;
         const metrics = cur.metrics;
         if (!metrics || metrics.length === 0) return;
+
+        document.getElementById('chartTitle').textContent = `Degradation Curve: ${cur.detector_label} vs ${cur.attacker_label}`;
+        document.getElementById('chartSubtitle').textContent = `Solid Red: Detection Rate (±1 SE) | Dashed Cyan: Mean Malicious Confidence (±1σ)`;
 
         // 1. Shaded Variance Area for Detection Rate (±1 SE)
         ctx.fillStyle = 'rgba(244, 63, 94, 0.15)';
@@ -2441,15 +3856,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           else ctx.lineTo(x, y);
         });
         ctx.stroke();
-        ctx.setLineDash([]); // Reset line dash
+        ctx.setLineDash([]);
 
-        // 5. Store Hit Points
         metrics.forEach(m => {
           const x = padLeft + (m.budget / maxB) * plotW;
           const yDet = padTop + plotH - m.detection_rate * plotH;
           const yConf = padTop + plotH - m.mean_pert_confidence * plotH;
 
-          // Draw point circles
           ctx.fillStyle = '#f43f5e';
           ctx.beginPath();
           ctx.arc(x, yDet, 4, 0, Math.PI * 2);
@@ -2467,26 +3880,38 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             detRate: m.detection_rate,
             conf: m.mean_pert_confidence,
             drop: m.mean_confidence_drop,
-            se: m.se_detection_rate,
-            std: m.std_pert_confidence,
-            detector: cur.name
+            detector: `${cur.detector_label} — ${cur.attacker_label}`
           });
         });
 
+        if (legendEl) {
+          legendEl.innerHTML = `
+            <div class="legend-item"><span class="legend-swatch" style="background:#f43f5e;"></span> Detection Rate (%) &pm; 1 SE</div>
+            <div class="legend-item"><span class="legend-swatch" style="background:#38bdf8;"></span> Mean Malicious Confidence (%) &pm; 1&sigma;</div>
+          `;
+        }
       } else {
-        // Multi-Detector Overlay
-        const palette = ['#f43f5e', '#10b981', '#a855f7', '#f59e0b', '#06b6d4'];
+        // Multi-Series Overlay
+        const metricLabel = yMetricMode === 'evasion'
+          ? 'Evasion Rate (%)'
+          : (yMetricMode === 'confidence' ? 'Mean Malicious Confidence (%)' : 'Detection Rate (%)');
 
-        BENCHMARK_DATA.forEach((det, idx) => {
-          const color = palette[idx % palette.length];
-          const metrics = det.metrics;
+        document.getElementById('chartTitle').textContent = `Multi-Curve Comparison — ${metricLabel}`;
+        document.getElementById('chartSubtitle').textContent = `Showing ${series.length} curve(s) across perturbation budgets. Click any legend item below to drill into that series.`;
 
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 2.4;
+        series.forEach(s => {
+          const metrics = s.metrics;
+          if (!metrics || metrics.length === 0) return;
+
+          ctx.strokeStyle = s.color;
+          ctx.lineWidth = 2.5;
           ctx.beginPath();
           metrics.forEach((m, i) => {
             const x = padLeft + (m.budget / maxB) * plotW;
-            const y = padTop + plotH - m.detection_rate * plotH;
+            const val = yMetricMode === 'evasion'
+              ? (1.0 - m.detection_rate)
+              : (yMetricMode === 'confidence' ? m.mean_pert_confidence : m.detection_rate);
+            const y = padTop + plotH - val * plotH;
             if (i === 0) ctx.moveTo(x, y);
             else ctx.lineTo(x, y);
           });
@@ -2494,10 +3919,14 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
           metrics.forEach(m => {
             const x = padLeft + (m.budget / maxB) * plotW;
-            const y = padTop + plotH - m.detection_rate * plotH;
-            ctx.fillStyle = color;
+            const val = yMetricMode === 'evasion'
+              ? (1.0 - m.detection_rate)
+              : (yMetricMode === 'confidence' ? m.mean_pert_confidence : m.detection_rate);
+            const y = padTop + plotH - val * plotH;
+
+            ctx.fillStyle = s.color;
             ctx.beginPath();
-            ctx.arc(x, y, 3.5, 0, Math.PI * 2);
+            ctx.arc(x, y, 3.8, 0, Math.PI * 2);
             ctx.fill();
 
             chartDataPoints.push({
@@ -2507,10 +3936,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               detRate: m.detection_rate,
               conf: m.mean_pert_confidence,
               drop: m.mean_confidence_drop,
-              se: m.se_detection_rate,
-              detector: det.name
+              detector: s.label
             });
           });
+
+          if (legendEl) {
+            const item = document.createElement('div');
+            item.className = 'legend-item';
+            item.innerHTML = `<span class="legend-swatch" style="background:${s.color};"></span> <span>${escapeHtml(s.label)}</span>`;
+            if (s.onClick) item.onclick = s.onClick;
+            legendEl.appendChild(item);
+          }
         });
       }
     }
@@ -2535,12 +3971,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const tip = document.getElementById('chartTooltip');
       if (closest) {
         tip.style.display = 'block';
-        tip.style.left = `${closest.x + 14}px`;
-        tip.style.top = `${closest.y - 10}px`;
+        tip.style.left = `${Math.min(rect.width - 220, Math.max(10, closest.x + 14))}px`;
+        tip.style.top = `${Math.max(10, closest.y - 10)}px`;
         tip.innerHTML = `
-          <strong>${closest.detector}</strong><br>
+          <strong>${escapeHtml(closest.detector)}</strong><br>
           Budget: <strong>${(closest.budget * 100).toFixed(0)}%</strong><br>
-          Detection Rate: <strong style="color:var(--evaded-red);">${(closest.detRate * 100).toFixed(1)}%</strong><br>
+          Evasion Rate: <strong style="color:var(--evaded-red);">${((1 - closest.detRate) * 100).toFixed(1)}%</strong><br>
+          Detection Retained: <strong style="color:var(--caught-green);">${(closest.detRate * 100).toFixed(1)}%</strong><br>
           Malicious Conf: <strong style="color:var(--accent-cyan);">${(closest.conf * 100).toFixed(1)}%</strong><br>
           &Delta; Conf Drop: <strong>-${(closest.drop * 100).toFixed(1)}%</strong>
         `;
@@ -2559,10 +3996,30 @@ def build_html_report(run_title: str, base_dir: Path, detectors_data: list[dict]
     # Common metadata
     first_cfg = detectors_data[0]["config"]
     timestamp = first_cfg.get("timestamp", base_dir.name)
-    attacker_name = first_cfg.get("attacker_display_name", "TextFooler")
     seed = first_cfg.get("seed", 42)
     max_budget = first_cfg.get("max_budget", 0.2)
     budget_steps = first_cfg.get("budget_steps", 20)
+
+    # Summarize unique detectors and attackers across all loaded runs
+    unique_det_labels = []
+    unique_att_labels = []
+    for d in detectors_data:
+        dlbl = d.get("detector_label") or d["name"]
+        albl = d.get("attacker_label") or d["config"].get("attacker_display_name", "TextFooler")
+        if dlbl not in unique_det_labels:
+            unique_det_labels.append(dlbl)
+        if albl not in unique_att_labels:
+            unique_att_labels.append(albl)
+
+    if len(unique_att_labels) == 1:
+        attacker_summary = unique_att_labels[0]
+    else:
+        attacker_summary = f"{len(unique_att_labels)} Attack Algorithms"
+
+    if len(unique_det_labels) == 1:
+        detector_summary = unique_det_labels[0]
+    else:
+        detector_summary = f"{len(unique_det_labels)} Models ({', '.join(unique_det_labels)})"
 
     # Serialize detector data cleanly for JS
     js_detectors = []
@@ -2570,6 +4027,11 @@ def build_html_report(run_title: str, base_dir: Path, detectors_data: list[dict]
         js_detectors.append({
             "key": d["key"],
             "name": d["name"],
+            "detector_id": d.get("detector_id", d["key"]),
+            "detector_label": d.get("detector_label", d["name"]),
+            "attacker_id": d.get("attacker_id", d["config"].get("attacker_key", "textfooler")),
+            "attacker_label": d.get("attacker_label", d["config"].get("attacker_display_name", "TextFooler")),
+            "attack_category": d.get("attack_category", "content"),
             "config": d["config"],
             "metrics": d["metrics"],
             "summary": d["summary"],
@@ -2602,7 +4064,9 @@ def build_html_report(run_title: str, base_dir: Path, detectors_data: list[dict]
     # Substitute tokens in non-f-string template
     output_html = HTML_TEMPLATE
     output_html = output_html.replace("__RUN_TITLE__", html.escape(run_title))
-    output_html = output_html.replace("__ATTACKER_NAME__", html.escape(attacker_name))
+    output_html = output_html.replace("__ATTACKER_NAME__", html.escape(attacker_summary))
+    output_html = output_html.replace("__DETECTOR_SUMMARY__", html.escape(detector_summary))
+    output_html = output_html.replace("__RUN_COUNT__", str(len(detectors_data)))
     output_html = output_html.replace("__TIMESTAMP__", html.escape(str(timestamp)))
     output_html = output_html.replace("__MAX_BUDGET_PCT__", str(int(max_budget * 100)))
     output_html = output_html.replace("__BUDGET_STEPS__", str(budget_steps))
@@ -2671,17 +4135,26 @@ def main():
     # Determine report title
     first_det = detectors_data[0]
     run_ts = first_det["config"].get("timestamp", base_dir.name)
-    attacker_name = first_det["config"].get("attacker_display_name", "Adversarial Attack")
+    unique_dets = {d["detector_id"] for d in detectors_data}
+    unique_atts = {d["attacker_id"] for d in detectors_data}
 
     if args.title:
         title = args.title
+    elif len(unique_dets) > 1 and len(unique_atts) > 1:
+        title = f"Adversarial Benchmark Matrix: {len(unique_dets)} Detectors × {len(unique_atts)} Attacks ({run_ts})"
     elif len(detectors_data) > 1:
+        attacker_name = first_det["attacker_label"]
         title = f"{attacker_name} Multi-Detector Degradation Benchmark ({run_ts})"
     else:
+        attacker_name = first_det["attacker_label"]
         title = f"{attacker_name} vs. {first_det['name']} Degradation Analysis ({run_ts})"
 
+    # Generate 2D Summary Tables (summary_table.txt, table.txt, summary_matrix.csv)
+    summary_text, matrix_csv_path = generate_summary_tables(base_dir, detectors_data)
+    print("\n" + summary_text)
+
     # Generate HTML
-    print("\nGenerating interactive HTML report ...")
+    print("Generating interactive HTML report ...")
     html_content = build_html_report(title, base_dir, detectors_data)
 
     # Determine output file path
@@ -2695,8 +4168,10 @@ def main():
         f.write(html_content)
 
     print(f"\nReport successfully generated!")
-    print(f"File Path : {out_path}")
-    print(f"File Size : {out_path.stat().st_size / 1024:.1f} KB")
+    print(f"HTML Report   : {out_path}")
+    print(f"Matrix CSV    : {matrix_csv_path}")
+    print(f"Summary Table : {base_dir / 'summary_table.txt'}")
+    print(f"File Size     : {out_path.stat().st_size / 1024:.1f} KB")
 
     if args.open:
         import webbrowser
