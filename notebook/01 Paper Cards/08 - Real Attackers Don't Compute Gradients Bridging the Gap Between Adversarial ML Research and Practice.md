@@ -10,7 +10,7 @@ project: "Adversarial Robustness Harness"
 
 **1. Full citation and link.**
 > **Citation:** Apruzzese, G., Anderson, H. S., Dambra, S., Freeman, D., Pierazzi, F., & Roundy, K. (2022). "Real Attackers Don't Compute Gradients": Bridging the Gap Between Adversarial ML Research and Practice. *University of Liechtenstein, Robust Intelligence, Norton Research Group, Meta, King's College London*. 
-> **Link:** (PDF Reference) 08 - “Real Attackers Don’t Compute Gradients”: Bridging the Gap Between Adversarial ML Research and Practice - real_attackers.pdf
+> **Link:** https://theory.stanford.edu/~dfreeman/papers/real_attackers.pdf
 
 ---
 
