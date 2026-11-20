@@ -55,15 +55,11 @@ def test_skip_flipped_skips_already_flipped_samples(tmp_path):
     mock_detector = MagicMock()
 
     # Step-by-step predictions:
-    # 1. load_malicious_samples calls predict for sample 0: [1]
-    # 2. load_malicious_samples calls predict for sample 1: [1]
-    # 3. original_preds: predict([s0, s1]) -> [1, 1]
-    # 4. Sweep Step 1: active=[0, 1] -> sample 0 flips (0), sample 1 does not (1) -> [0, 1]
-    # 5. Sweep Step 2: active=[1] -> sample 1 flips (0) -> [0]
+    # 1. original_preds: predict([s0, s1]) -> [1, 1]
+    # 2. Sweep Step 1: active=[0, 1] -> sample 0 flips (0), sample 1 does not (1) -> [0, 1]
+    # 3. Sweep Step 2: active=[1] -> sample 1 flips (0) -> [0]
     # (Sweep Step 3: active=[] -> no predict call)
     predict_responses = [
-        [1],     # load sample 0
-        [1],     # load sample 1
         [1, 1],  # original_preds
         [0, 1],  # step 1 sweep: sample 0 flips
         [0],     # step 2 sweep: sample 1 flips
@@ -179,8 +175,6 @@ def test_skip_flipped_false_attacks_every_sample(tmp_path):
     mock_detector = MagicMock()
 
     predict_responses = [
-        [1],     # load sample 0
-        [1],     # load sample 1
         [1, 1],  # original_preds
         [0, 0],  # step 1 sweep: both flip
         [0, 0],  # step 2 sweep: both attacked again
@@ -249,8 +243,6 @@ def test_skip_flipped_all_flipped_at_step_one(tmp_path):
     mock_detector = MagicMock()
 
     predict_responses = [
-        [1],     # load sample 0
-        [1],     # load sample 1
         [1, 1],  # original_preds
         [0, 0],  # step 1 sweep: BOTH flip to 0
     ]
@@ -647,4 +639,97 @@ def test_visualize_results_2d_matrix_and_html_report(tmp_path):
     assert '"detector_id": "logistic_regression"' in html_out
     assert '"attacker_id": "html_tag"' in html_out
     assert '"attack_category": "structure"' in html_out
+
+
+def test_sample_selection_rejects_unclassified_without_refilling_and_preserves_sample_idx(tmp_path):
+    """
+    Verify that:
+    1. Setting num_samples=3 picks 3 random samples as a maximum and rejects any that fail
+       initial classification without pulling extra samples from the dataset to reach 3.
+    2. 'sample_idx' in raw_results.csv preserves each sample's original index from the initial
+       n random samples, so 'Sample #k' refers to the exact same text across different detectors.
+    """
+    import base64
+
+    data_file = tmp_path / "texts.json"
+    dataset = [
+        {"text": f"Malicious sample text number {i}", "label": 1}
+        for i in range(10)
+    ]
+    data_file.write_text(json.dumps(dataset))
+
+    # Detector A classifies sample 0 and sample 2 as malicious, but fails on sample 1 -> [1, 0, 1]
+    det_a = MagicMock()
+    det_a.predict.side_effect = [
+        [1, 0, 1],  # original_preds for 3 picked samples
+        [1, 1],     # step 1 sweep on the 2 valid samples
+    ]
+    det_a.predict_proba.side_effect = [
+        [[0.1, 0.9], [0.8, 0.2], [0.2, 0.8]],
+        [[0.2, 0.8], [0.3, 0.7]],
+    ]
+
+    # Detector B fails on sample 0, but classifies sample 1 and sample 2 as malicious -> [0, 1, 1]
+    det_b = MagicMock()
+    det_b.predict.side_effect = [
+        [0, 1, 1],  # original_preds for 3 picked samples
+        [1, 1],     # step 1 sweep on the 2 valid samples
+    ]
+    det_b.predict_proba.side_effect = [
+        [[0.7, 0.3], [0.1, 0.9], [0.2, 0.8]],
+        [[0.2, 0.8], [0.3, 0.7]],
+    ]
+
+    def mock_attack_text(text, budget_frac, attacker):
+        return f"perturbed: {text}", 1, True
+
+    out_a = tmp_path / "det_a"
+    out_b = tmp_path / "det_b"
+
+    with patch("run_analysis.attack_text", side_effect=mock_attack_text):
+        with patch("run_analysis.load_detector", return_value=(det_a, "det_a", {"display_name": "Det A"}, Path("/mock/a"))):
+            run_single_analysis(
+                detector_type="logistic_regression",
+                attacker_type="sender_header",
+                num_samples=3,
+                max_budget=0.10,
+                budget_steps=1,
+                seed=42,
+                data_path=data_file,
+                output_dir=out_a,
+            )
+
+        with patch("run_analysis.load_detector", return_value=(det_b, "det_b", {"display_name": "Det B"}, Path("/mock/b"))):
+            run_single_analysis(
+                detector_type="char_cnn",
+                attacker_type="sender_header",
+                num_samples=3,
+                max_budget=0.10,
+                budget_steps=1,
+                seed=42,
+                data_path=data_file,
+                output_dir=out_b,
+            )
+
+    cfg_a = json.loads((out_a / "run_config.json").read_text(encoding="utf-8"))
+    cfg_b = json.loads((out_b / "run_config.json").read_text(encoding="utf-8"))
+
+    # Both requested 3 samples, and each evaluated on only 2 valid samples (did NOT refill from remaining 7 dataset items)
+    assert cfg_a["num_samples_requested"] == 3
+    assert cfg_a["num_samples_valid"] == 2
+    assert cfg_b["num_samples_requested"] == 3
+    assert cfg_b["num_samples_valid"] == 2
+
+    with open(out_a / "raw_results.csv", "r", encoding="utf-8") as f:
+        rows_a = {int(r["sample_idx"]): base64.b64decode(r["original_text_b64"]).decode("utf-8") for r in csv.DictReader(f)}
+    with open(out_b / "raw_results.csv", "r", encoding="utf-8") as f:
+        rows_b = {int(r["sample_idx"]): base64.b64decode(r["original_text_b64"]).decode("utf-8") for r in csv.DictReader(f)}
+
+    # Detector A kept samples 0 and 2; Detector B kept samples 1 and 2
+    assert list(rows_a.keys()) == [0, 2]
+    assert list(rows_b.keys()) == [1, 2]
+
+    # Sample #2 is the exact same text across both detectors
+    assert rows_a[2] == rows_b[2]
+
 

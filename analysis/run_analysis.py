@@ -248,10 +248,9 @@ def resolve_attackers(spec_str: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Data & Model Helpers
 # ---------------------------------------------------------------------------
-def load_malicious_samples(path: Path, n: int, seed: int, detector=None) -> list[dict]:
+def load_malicious_samples(path: Path, n: int, seed: int) -> list[dict]:
     """
-    Loads malicious samples (label=1) deterministically.
-    If detector is provided, filters for samples that the detector actually detects (pred=1).
+    Loads up to n malicious samples (label=1) deterministically using the given seed.
     """
     print(f"Loading data from {path} ...")
     with open(path, "r", encoding="utf-8") as f:
@@ -260,24 +259,12 @@ def load_malicious_samples(path: Path, n: int, seed: int, detector=None) -> list
     malicious = [item for item in data if item.get("label") == 1]
     print(f"  Total entries: {len(data)}, malicious: {len(malicious)}")
 
-    random.seed(seed)
-    shuffled = random.sample(malicious, len(malicious))
-
-    if detector is not None:
-        detected = []
-        for s in shuffled:
-            pred = detector.predict([s["text"]])[0]
-            if pred == 1:
-                detected.append(s)
-                if len(detected) == n:
-                    break
-        print(f"  Found {len(detected)} samples detected as malicious by target detector.")
-        return detected
-
     if len(malicious) < n:
         print(f"  WARNING: only {len(malicious)} malicious samples available")
         n = len(malicious)
-    return shuffled[:n]
+
+    random.seed(seed)
+    return random.sample(malicious, n)
 
 
 def load_detector(detector_type: str, model_path: Path | str | None = None):
@@ -452,8 +439,8 @@ def run_single_analysis(
     # Calculate budget sweep
     budgets = [round((i / budget_steps) * max_budget, 4) for i in range(1, budget_steps + 1)]
 
-    # Load dataset (filtered for samples detected as malicious)
-    samples = load_malicious_samples(data_file, num_samples, seed, detector=detector)
+    # Load dataset
+    samples = load_malicious_samples(data_file, num_samples, seed)
 
     # Initialize oracle and attacker
     oracle = create_oracle(detector)
@@ -659,7 +646,7 @@ def run_single_analysis(
 
                 raw_writer.writerow({
                     "budget": budget_frac,
-                    "sample_idx": i,
+                    "sample_idx": valid_indices[i],
                     "original_pred": 1,
                     "perturbed_pred": int(step_pert_preds[i]),
                     "original_confidence": round(orig_confidences[i], 6),

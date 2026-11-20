@@ -3153,10 +3153,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         bSelect.appendChild(opt);
       });
 
-      Object.keys(sampleDet.sample_word_counts).map(Number).sort((a,b) => a-b).forEach(idx => {
+      const allWordCounts = {};
+      BENCHMARK_DATA.forEach(d => {
+        Object.entries(d.sample_word_counts || {}).forEach(([k, v]) => {
+          if (allWordCounts[k] === undefined) allWordCounts[k] = v;
+        });
+      });
+      Object.keys(allWordCounts).map(Number).sort((a,b) => a-b).forEach(idx => {
         const opt = document.createElement('option');
         opt.value = idx;
-        opt.textContent = `Sample #${idx} (${sampleDet.sample_word_counts[idx]} words)`;
+        opt.textContent = `Sample #${idx} (${allWordCounts[idx]} words)`;
         sSelect.appendChild(opt);
       });
     }
