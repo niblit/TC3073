@@ -1698,6 +1698,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       text-align: left;
       font-size: 11px;
       border-bottom: 1px solid var(--border-subtle);
+      position: sticky;
+      top: 0;
+      z-index: 1;
     }
     .substitutions-table td {
       padding: 6px 10px;
@@ -3412,7 +3415,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       `).join('');
 
       return `
-        <div class="diff-container" style="padding:0; overflow:hidden;">
+        <div class="diff-container" style="padding:0; overflow-y:auto; overflow-x:auto;">
           <table class="substitutions-table">
             <thead>
               <tr>
