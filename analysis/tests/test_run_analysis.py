@@ -1068,4 +1068,321 @@ def test_greedy_mode_stops_querying_oracle_after_evasion_or_exhaustion(tmp_path)
     assert len(oracle_queries) == 6
 
 
+def test_resolve_attacker_and_resolve_attackers_combined_and_combine_all():
+    """
+    Verify resolve_attacker and resolve_attackers support:
+    - 'combine_all' and aliases ('combined_all', 'all_combined', 'combine-all', 'best_of_all')
+    - 'combined' and aliases ('best_of_k', 'multi_argmax', 'combined_structure')
+    - '+'-joined dynamic combinations with priority sorting & deduplication
+    - canonical 'combined_<k1>_<k2>...' round-tripping
+    - mixed ',' and '+' CLI specifications
+    """
+    from run_analysis import resolve_attacker, resolve_attackers, CombinedAttack
+
+    # 1. 'combine_all' and aliases
+    for alias in ("combine_all", "combined_all", "all_combined", "combine-all", "best_of_all"):
+        key, spec = resolve_attacker(alias)
+        assert key == "combine_all"
+        assert spec["category"] == "combined"
+        inst = spec["factory"](lambda t: ("phishing", 0.9))
+        assert isinstance(inst, CombinedAttack)
+        assert "homoglyph" in inst.constituent_keys
+        assert "zero_width" in inst.constituent_keys
+        assert "html_tag" in inst.constituent_keys
+        assert "sender_header" in inst.constituent_keys
+
+    # 2. 'combined' and aliases
+    for alias in ("combined", "best_of_k", "multi_argmax", "combined_structure"):
+        key, spec = resolve_attacker(alias)
+        assert key == "combined"
+        assert spec["category"] == "combined"
+        inst = spec["factory"](lambda t: ("phishing", 0.9))
+        assert isinstance(inst, CombinedAttack)
+        assert inst.constituent_keys == ["homoglyph", "zero_width", "html_entity", "html_tag"]
+
+    # 3. '+'-joined dynamic combinations with aliases, deduplication, and priority sorting
+    key, spec = resolve_attacker("html_tag+zw+confusables+zero_width")
+    assert key == "combined_homoglyph_zero_width_html_tag"
+    assert spec["category"] == "combined"
+    assert spec["constituent_attacks"] == ["homoglyph", "zero_width", "html_tag"]
+    inst = spec["factory"](lambda t: ("phishing", 0.9))
+    assert isinstance(inst, CombinedAttack)
+    assert inst.constituent_keys == ["homoglyph", "zero_width", "html_tag"]
+
+    # 4. Canonical key round-tripping (as invoked by run_single_analysis after resolve_attackers)
+    rt_key, rt_spec = resolve_attacker("combined_homoglyph_zero_width_html_tag")
+    assert rt_key == "combined_homoglyph_zero_width_html_tag"
+    assert rt_spec["category"] == "combined"
+    assert rt_spec["constituent_attacks"] == ["homoglyph", "zero_width", "html_tag"]
+
+    # 5. Mixed ',' and '+' specification in resolve_attackers
+    mixed = resolve_attackers("zero_width,homoglyph,zero_width+homoglyph,combine_all")
+    assert mixed == [
+        "zero_width",
+        "homoglyph",
+        "combined_homoglyph_zero_width",
+        "combine_all",
+    ]
+
+
+def test_combined_attack_greedy_vs_non_greedy_equivalence_and_space_tags(tmp_path):
+    """
+    End-to-end integration test running run_single_analysis with a CombinedAttack
+    ('zero_width+homoglyph+html_tag') across 4 budget steps (5%, 10%, 15%, 20% -> 1, 2, 3, 4 edits)
+    where HTMLTagInjectionAttack injects `<font style="font-size:inherit"></font>` (containing an
+    internal space) on one word while Homoglyph and ZeroWidth win on other words.
+    Verifies:
+    1. Greedy mode and Non-Greedy mode produce the EXACT same perturbed texts, predictions,
+       confidences, and real_budget_consumed at all 4 budget steps.
+    2. Greedy mode makes significantly fewer oracle queries than Non-Greedy mode.
+    3. attack_attribution.json and run_config.json record constituent_attacks and per-edit trace.
+    """
+    import base64
+    import re
+
+    sample_text = (
+        "Urgent security alert please verify corporate account password "
+        "credentials immediately avoid suspension banking access portal "
+        "login confirmation required today now"
+    )
+    assert len(sample_text.split()) == 20
+
+    data_file = tmp_path / "texts.json"
+    data_file.write_text(json.dumps([{"text": sample_text, "label": 1}]))
+
+    def make_combined_detector():
+        det = MagicMock()
+        query_count = [0]
+
+        def score_text(t: str) -> float:
+            tokens = re.findall(r"(?:<[^>]+>|\S)+", t)
+            tokens_lower = [tok.lower() for tok in tokens]
+            score = 0.60
+            # Give baseline importance to 4 key words so they rank top-4:
+            # "password" (+0.10), "verify" (+0.09), "credentials" (+0.08), "account" (+0.07)
+            if "password" in tokens_lower:
+                score += 0.10
+            if "verify" in tokens_lower:
+                score += 0.09
+            if "credentials" in tokens_lower:
+                score += 0.08
+            if "account" in tokens_lower:
+                score += 0.07
+
+            # Make specific attack vectors win on different words (including <font style="font-size:inherit"></font>):
+            if any('<font style="font-size:inherit"></font>' in tok for tok in tokens):
+                score -= 0.03
+            if any("\u0430" in tok for tok in tokens):
+                score -= 0.025
+            if any("\u200b" in tok for tok in tokens):
+                score -= 0.02
+            return round(max(0.51, min(0.96, score)), 4)
+
+        def predict(texts):
+            query_count[0] += len(texts)
+            return [1 if score_text(t) >= 0.50 else 0 for t in texts]
+
+        def predict_proba(texts):
+            return [[round(1.0 - score_text(t), 4), score_text(t)] for t in texts]
+
+        det.predict.side_effect = predict
+        det.predict_proba.side_effect = predict_proba
+        return det, query_count
+
+    det_greedy, count_greedy = make_combined_detector()
+    det_non_greedy, count_non_greedy = make_combined_detector()
+
+    out_greedy = tmp_path / "combined_greedy"
+    out_non_greedy = tmp_path / "combined_non_greedy"
+
+    with patch("run_analysis.load_detector", return_value=(det_greedy, "lr", {"display_name": "LR"}, Path("/mock/lr"))):
+        run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="zero_width+homoglyph+html_tag",
+            num_samples=1,
+            max_budget=0.20,
+            budget_steps=4,
+            seed=42,
+            data_path=data_file,
+            output_dir=out_greedy,
+            greedy=True,
+        )
+
+    with patch("run_analysis.load_detector", return_value=(det_non_greedy, "lr", {"display_name": "LR"}, Path("/mock/lr"))):
+        run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="zero_width+homoglyph+html_tag",
+            num_samples=1,
+            max_budget=0.20,
+            budget_steps=4,
+            seed=42,
+            data_path=data_file,
+            output_dir=out_non_greedy,
+            non_greedy=True,
+        )
+
+    with open(out_greedy / "raw_results.csv", "r", encoding="utf-8") as f:
+        rows_g = list(csv.DictReader(f))
+    with open(out_non_greedy / "raw_results.csv", "r", encoding="utf-8") as f:
+        rows_ng = list(csv.DictReader(f))
+
+    assert len(rows_g) == 4
+    assert len(rows_ng) == 4
+
+    for idx, (rg, rng) in enumerate(zip(rows_g, rows_ng), start=1):
+        assert rg["budget"] == rng["budget"]
+        pert_g = base64.b64decode(rg["perturbed_text_b64"]).decode("utf-8")
+        pert_ng = base64.b64decode(rng["perturbed_text_b64"]).decode("utf-8")
+        assert pert_g == pert_ng
+        assert rg["perturbed_confidence"] == rng["perturbed_confidence"]
+        assert int(rg["real_budget_consumed"]) == int(rng["real_budget_consumed"]) == idx
+
+    # Verify space-containing <font style="font-size:inherit"></font> and homoglyph were both used
+    final_pert = base64.b64decode(rows_g[-1]["perturbed_text_b64"]).decode("utf-8")
+    assert '<font style="font-size:inherit"></font>' in final_pert
+    assert "\u0430" in final_pert
+
+    # Greedy mode must make significantly fewer oracle calls than Non-Greedy mode
+    assert count_greedy[0] < count_non_greedy[0] * 0.55
+
+    # Verify attack_attribution.json and run_config.json were saved
+    cfg = json.loads((out_greedy / "run_config.json").read_text(encoding="utf-8"))
+    assert cfg["attacker_category"] == "combined"
+    assert cfg["constituent_attacks"] == ["homoglyph", "zero_width", "html_tag"]
+    assert (out_greedy / "attack_attribution.json").exists()
+
+
+def test_visualize_results_combined_attack_stats_and_html_report(tmp_path):
+    """
+    Verify that visualize_results.py (load_detector_run, generate_summary_tables,
+    build_html_report) accurately attributes constituent attacks per sample, computes
+    frequency/coverage/impact/flip statistics in attack_breakdown, outputs the
+    COMBINED ATTACK CONSTITUENT BREAKDOWN table in summary_table.txt, and renders
+    the Combined Attack Constituent Telemetry section in report.html.
+    """
+    import base64
+    from visualize_results import (
+        _infer_detector_and_attacker,
+        classify_perturbation_attack,
+        load_detector_run,
+        generate_summary_tables,
+        build_html_report,
+    )
+
+    # 1. Test _infer_detector_and_attacker with dynamic combined folder name
+    inferred = _infer_detector_and_attacker(
+        {"detector_key": "char_cnn_combined_homoglyph_zero_width"},
+        "char_cnn_combined_homoglyph_zero_width",
+    )
+    assert inferred["detector_id"] == "char_cnn"
+    assert inferred["attacker_id"] == "combined_homoglyph_zero_width"
+    assert inferred["attack_category"] == "combined"
+    assert "Homoglyph" in inferred["attacker_label"]
+
+    # 2. Test classify_perturbation_attack across attack types
+    assert classify_perturbation_attack("password", "p\u0430ssword") == "homoglyph"
+    assert classify_perturbation_attack("password", "pass\u200bword") == "zero_width"
+    assert classify_perturbation_attack("password", "pass<span></span>word") == "html_tag"
+    assert classify_perturbation_attack("password", "p&#97;ssword") == "html_entity"
+    assert classify_perturbation_attack("password", "pass<!--1000-->word") == "html_comment"
+    assert classify_perturbation_attack("verify", "confirm") == "textfooler"
+
+    # 3. Run an end-to-end combined analysis and generate visualization artifacts
+    samples = [
+        {"text": "Urgent please verify account password immediately today", "label": 1},
+        {"text": "Security alert confirm banking login credentials now", "label": 1},
+    ]
+    data_file = tmp_path / "texts.json"
+    data_file.write_text(json.dumps(samples))
+
+    det = MagicMock()
+
+    def score_text(t: str) -> float:
+        # Sample 0 flips when homoglyph \u0430 is injected; Sample 1 drops confidence with html_tag <span></span>
+        if "\u0430" in t and "verify" in t:
+            return 0.15  # flipped to benign (0.85 benign conf)
+        if "<span></span>" in t:
+            return 0.30  # flipped to benign (0.70 benign conf)
+        if "\u200b" in t:
+            return 0.65
+        return 0.92
+
+    det.predict.side_effect = lambda texts: [1 if score_text(t) >= 0.50 else 0 for t in texts]
+    det.predict_proba.side_effect = lambda texts: [[round(1.0 - score_text(t), 4), score_text(t)] for t in texts]
+
+    run_dir = tmp_path / "results" / "logistic_regression_combined"
+    with patch("run_analysis.load_detector", return_value=(det, "logistic_regression", {"display_name": "Logistic Regression (TF-IDF)"}, Path("/mock/lr"))):
+        run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="combined",
+            num_samples=2,
+            max_budget=0.20,
+            budget_steps=2,
+            seed=42,
+            data_path=data_file,
+            output_dir=run_dir,
+            parallel=True,
+            num_workers=2,
+            word_ranking=True,
+            skip_flipped=True,
+        )
+
+    loaded = load_detector_run(run_dir)
+    assert loaded["attack_category"] == "combined"
+    assert len(loaded["attack_breakdown"]) >= 4
+
+    # Verify per-sample constituent attack attribution on raw_rows
+    for row in loaded["raw_rows"]:
+        assert len(row["attacks_used"]) >= 1
+        assert sum(row["attack_counts"].values()) >= 1
+        assert row["flip_attack"] in ("homoglyph", "html_tag")
+
+    # Verify active constituent vectors have edit_count > 0 and flips_caused > 0 in attack_breakdown
+    active_vectors = [b for b in loaded["attack_breakdown"] if b["edit_count"] > 0]
+    assert len(active_vectors) >= 1
+    assert sum(b["flips_caused"] for b in active_vectors) == 2
+
+    # Verify summary_table.txt includes COMBINED ATTACK CONSTITUENT BREAKDOWN
+    summary_txt, matrix_csv = generate_summary_tables(tmp_path / "results", [loaded])
+    assert "COMBINED ATTACK CONSTITUENT BREAKDOWN" in summary_txt
+    assert "Homoglyph Substitution" in summary_txt
+    assert "HTML Tag Injection" in summary_txt
+
+    # Verify HTML report contains Combined Attack Constituent Telemetry section and per-sample attribution fields
+    html_report = build_html_report("Combined Benchmark Report", tmp_path / "results", [loaded])
+    assert "Combined Attack Constituent Telemetry" in html_report
+    assert '"attack_category": "combined"' in html_report
+    assert '"attack_breakdown":' in html_report
+    assert '"au":' in html_report
+    assert '"ac":' in html_report
+    assert '"fa":' in html_report
+
+
+def test_resolve_results_directory_single_run_saves_inside_timestamp_folder(tmp_path):
+    """
+    Regression test: when a single analysis run saves raw_results.csv directly inside
+    results/<timestamp>/, resolve_results_directory must return results/<timestamp>/
+    as base_dir (NOT results/ root) so report.html, summary_matrix.csv, summary_table.txt,
+    and table.txt are saved inside results/<timestamp>/.
+    """
+    from visualize_results import resolve_results_directory
+
+    results_root = tmp_path / "results"
+    ts_dir = results_root / "20261120-185150"
+    ts_dir.mkdir(parents=True)
+    (ts_dir / "raw_results.csv").write_text("budget,sample_idx\n0.1,0\n", encoding="utf-8")
+
+    # 1. Direct call on timestamp dir (as invoked by run_analysis.py --report)
+    base_dir, detector_dirs = resolve_results_directory(str(ts_dir))
+    assert base_dir == ts_dir
+    assert detector_dirs == [ts_dir]
+
+    # 2. Call on results_root (auto-selects latest timestamp dir)
+    base_dir_from_root, detector_dirs_from_root = resolve_results_directory(str(results_root))
+    assert base_dir_from_root == ts_dir
+    assert detector_dirs_from_root == [ts_dir]
+
+
+
+
 

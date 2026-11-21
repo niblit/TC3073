@@ -12,6 +12,7 @@ and adversarial attack harnesses.
 
 import sys
 import os
+import re
 import json
 import random
 import csv
@@ -65,6 +66,16 @@ from harness.attacks import (
     ReceivedRoutingAttack,
     XHeaderInjectionAttack,
     SubjectMetadataAttack,
+    # Combined (Per-Word Best-of-K)
+    CombinedAttack,
+    PerWordBestOfKAttack,
+    ATTACK_PRIORITY_ORDER,
+    ATTACK_TIER_MAP,
+    ATTACK_DISPLAY_NAMES,
+    DEFAULT_COMBINED_ATTACKS,
+    ALL_COMBINED_ATTACKS,
+    normalize_constituent_attack_key,
+    sort_attack_keys_by_priority,
 )
 
 # ---------------------------------------------------------------------------
@@ -175,6 +186,30 @@ ATTACKER_REGISTRY = {
         "aliases": ["spoofing"],
         "category": "metadata",
     },
+
+    # ── Combined Multi-Attack Best-of-K Presets ──
+    "combined": {
+        "factory": lambda oracle: CombinedAttack(
+            name="combined_attack",
+            target_model_oracle=oracle,
+            attacks=DEFAULT_COMBINED_ATTACKS,
+        ),
+        "display_name": "Combined Structure Attack (Best-of-K)",
+        "aliases": ["best_of_k", "multi_argmax", "combined_structure", "per_word_best_of_k"],
+        "category": "combined",
+        "constituent_attacks": list(DEFAULT_COMBINED_ATTACKS),
+    },
+    "combine_all": {
+        "factory": lambda oracle: CombinedAttack(
+            name="combine_all_attack",
+            target_model_oracle=oracle,
+            attacks=ALL_COMBINED_ATTACKS,
+        ),
+        "display_name": "Combined All Attacks (Best-of-K)",
+        "aliases": ["combined_all", "all_combined", "combine-all", "best_of_all", "combine_all_attacks"],
+        "category": "combined",
+        "constituent_attacks": list(ALL_COMBINED_ATTACKS),
+    },
 }
 
 NEW_ATTACKERS = [
@@ -203,15 +238,114 @@ def resolve_detector(name_or_alias: str):
     )
 
 
+def _build_combined_attacker_spec(constituent_keys: list[str]) -> tuple[str, dict]:
+    """
+    Constructs a canonical filesystem-safe key and ATTACKER_REGISTRY-compatible
+    spec dict for a dynamic combination of 1 to K constituent attacks.
+    """
+    sorted_keys = sort_attack_keys_by_priority(constituent_keys)
+    if not sorted_keys:
+        raise ValueError("Combined attacker specification requires at least one constituent attack.")
+    canonical_key = f"combined_{'_'.join(sorted_keys)}"
+    short_labels = [
+        ATTACK_DISPLAY_NAMES.get(k, k.replace("_", " ").title())
+        for k in sorted_keys
+    ]
+    display_name = f"Combined ({' + '.join(short_labels)})"
+    spec = {
+        "factory": (
+            lambda keys, c_key: lambda oracle: CombinedAttack(
+                name=c_key,
+                target_model_oracle=oracle,
+                attacks=keys,
+            )
+        )(list(sorted_keys), canonical_key),
+        "display_name": display_name,
+        "aliases": ["+".join(sorted_keys), canonical_key],
+        "category": "combined",
+        "constituent_attacks": list(sorted_keys),
+    }
+    return canonical_key, spec
+
+
+def _parse_canonical_combined_key(clean_key: str) -> list[str] | None:
+    """
+    If `clean_key` has the form `combined_<k1>_<k2>...`, greedily parses and
+    returns the list of canonical constituent attack keys, or None if invalid.
+    """
+    if not clean_key.startswith("combined_"):
+        return None
+    rem = clean_key[len("combined_"):]
+    if not rem:
+        return None
+    candidates_by_len = sorted(ATTACK_PRIORITY_ORDER, key=len, reverse=True)
+    parsed: list[str] = []
+    while rem:
+        matched = None
+        for k in candidates_by_len:
+            if rem == k or rem.startswith(k + "_"):
+                matched = k
+                break
+        if matched is None:
+            return None
+        parsed.append(matched)
+        rem = rem[len(matched):]
+        if rem.startswith("_"):
+            rem = rem[1:]
+    return parsed if parsed else None
+
+
 def resolve_attacker(name_or_alias: str):
-    """Normalize and resolve a single attacker specification from name or alias."""
-    clean = name_or_alias.strip().lower().replace("-", "_")
+    """
+    Normalize and resolve a single attacker specification from name, alias,
+    preset ('combined', 'combine_all'), or '+'-joined dynamic combination
+    (e.g. 'zero_width+homoglyph+html_tag').
+    """
+    raw = name_or_alias.strip()
+    if not raw:
+        valid_options = list(ATTACKER_REGISTRY.keys())
+        raise ValueError(f"Empty attacker specification. Choose from: {valid_options}")
+
+    # 1. Check '+'-joined dynamic combination syntax
+    if "+" in raw:
+        parts = [p.strip() for p in raw.split("+")]
+        if any(not p for p in parts):
+            raise ValueError(f"Invalid '+'-joined attacker specification: '{name_or_alias}'")
+        constituent_keys: list[str] = []
+        for part in parts:
+            p_clean = part.lower().replace("-", "_")
+            if p_clean in ("new", "new_attacks", "new_attack"):
+                constituent_keys.extend(NEW_ATTACKERS)
+            elif p_clean in ("metadata", "meta"):
+                constituent_keys.extend(
+                    k for k, v in ATTACKER_REGISTRY.items() if v.get("category") == "metadata"
+                )
+            elif p_clean in ("structure", "struct"):
+                constituent_keys.extend(
+                    k for k, v in ATTACKER_REGISTRY.items() if v.get("category") == "structure"
+                )
+            else:
+                sub_key, sub_spec = resolve_attacker(part)
+                if "constituent_attacks" in sub_spec:
+                    constituent_keys.extend(sub_spec["constituent_attacks"])
+                else:
+                    constituent_keys.append(sub_key)
+        return _build_combined_attacker_spec(constituent_keys)
+
+    # 2. Direct registry key or alias lookup
+    clean = raw.lower().replace("-", "_")
     for key, spec in ATTACKER_REGISTRY.items():
-        if clean == key or clean in spec["aliases"]:
+        if clean == key or clean in [a.replace("-", "_") for a in spec["aliases"]]:
             return key, spec
+
+    # 3. Canonical 'combined_<k1>_<k2>...' key lookup
+    parsed_combined = _parse_canonical_combined_key(clean)
+    if parsed_combined:
+        return _build_combined_attacker_spec(parsed_combined)
+
     valid_options = list(ATTACKER_REGISTRY.keys())
     raise ValueError(
-        f"Unknown attacker '{name_or_alias}'. Choose from: {valid_options}"
+        f"Unknown attacker '{name_or_alias}'. Choose from: {valid_options} or '+'-joined combinations."
     )
 
 
@@ -223,8 +357,11 @@ def resolve_attackers(spec_str: str) -> list[str]:
     - 'all': all registered attackers
     - 'metadata': all metadata attackers
     - 'structure': all structure attackers
-    - Comma-separated list: e.g. 'sender_header,zero_width'
-    - Single attacker name or alias
+    - 'combined': default combined word-level structure attack (Best-of-K)
+    - 'combine_all': combined attack across all constituent attacks (Best-of-K)
+    - '+'-joined combinations: e.g. 'zero_width+homoglyph+html_tag'
+    - Comma-separated list (including mixed single, '+', and presets):
+      e.g. 'zero_width,homoglyph,zero_width+homoglyph,combine_all'
     """
     clean = spec_str.strip().lower()
     if clean in ("new", "new_attacks", "new_attack"):
@@ -239,9 +376,23 @@ def resolve_attackers(spec_str: str) -> list[str]:
     parts = [p.strip() for p in spec_str.split(",") if p.strip()]
     resolved_keys = []
     for part in parts:
-        key, _ = resolve_attacker(part)
-        if key not in resolved_keys:
-            resolved_keys.append(key)
+        p_clean = part.lower().replace("-", "_")
+        if p_clean in ("new", "new_attacks", "new_attack"):
+            for k in NEW_ATTACKERS:
+                if k not in resolved_keys:
+                    resolved_keys.append(k)
+        elif p_clean in ("metadata", "meta"):
+            for k, v in ATTACKER_REGISTRY.items():
+                if v.get("category") == "metadata" and k not in resolved_keys:
+                    resolved_keys.append(k)
+        elif p_clean in ("structure", "struct"):
+            for k, v in ATTACKER_REGISTRY.items():
+                if v.get("category") == "structure" and k not in resolved_keys:
+                    resolved_keys.append(k)
+        else:
+            key, _ = resolve_attacker(part)
+            if key not in resolved_keys:
+                resolved_keys.append(key)
     return resolved_keys
 
 
@@ -411,6 +562,8 @@ def attack_text(
     if sample_state is not None and not had_exception:
         if sample_state.get("cached_ranking") is None and getattr(budget, "computed_word_ranking", None) is not None:
             sample_state["cached_ranking"] = list(budget.computed_word_ranking)
+        if getattr(budget, "applied_attacks", None):
+            sample_state.setdefault("applied_attacks", []).extend(budget.applied_attacks)
         if getattr(budget, "evaluated_word_indices", None):
             visited = sample_state.setdefault("visited_word_indices", set())
             visited.update(budget.evaluated_word_indices)
@@ -420,20 +573,25 @@ def attack_text(
                     if (item[0] if isinstance(item, (tuple, list)) else item) not in visited
                     and (not isinstance(item, (tuple, list)) or len(item) < 2 or float(item[1]) > float("-inf"))
                 ]
-                if not remaining_actionable:
+                has_macro_envelope = any(
+                    k in ("dom_wrapper", "sender_header", "auth_results", "received_routing", "x_header", "subject_metadata", "timestamp")
+                    for k in getattr(attacker, "constituent_keys", [])
+                )
+                if not remaining_actionable and not has_macro_envelope:
                     sample_state["exhausted"] = True
         if budget.consumed == 0 and perturbed == text and effective_max_edits > 0:
             sample_state["exhausted"] = True
 
-    # Calculate real budget consumed (word differences or budget.consumed)
-    orig_words = text.split()
-    pert_words = perturbed.split()
-    min_len = min(len(orig_words), len(pert_words))
-
-    consumed = sum(1 for i in range(min_len) if orig_words[i] != pert_words[i])
-    consumed += abs(len(orig_words) - len(pert_words))
-    if consumed == 0 and budget.consumed > 0:
+    # Calculate real budget consumed (prefer explicit budget.consumed when > 0,
+    # otherwise fall back to tag-aware token difference count for legacy/mock transforms)
+    if budget.consumed > 0:
         consumed = budget.consumed
+    else:
+        orig_words = re.findall(r"(?:<[^>]+>|\S)+", text)
+        pert_words = re.findall(r"(?:<[^>]+>|\S)+", perturbed)
+        min_len = min(len(orig_words), len(pert_words))
+        consumed = sum(1 for i in range(min_len) if orig_words[i] != pert_words[i])
+        consumed += abs(len(orig_words) - len(pert_words))
 
     # If budget was requested but no edits were made, mark as failed
     if sample_state is not None:
@@ -645,9 +803,12 @@ def run_single_analysis(
                 else None
             ),
             "visited_word_indices": set(),
+            "applied_attacks": [],
         }
         for i in range(num_valid)
     }
+
+    attack_attribution_records: dict[str, list[dict]] = {}
 
     try:
         for step_idx, budget_frac in enumerate(budgets):
@@ -791,6 +952,10 @@ def run_single_analysis(
                     "original_text_b64": orig_b64,
                     "perturbed_text_b64": pert_b64
                 })
+                if sample_states[i].get("applied_attacks"):
+                    attack_attribution_records[f"{budget_frac}_{valid_indices[i]}"] = [
+                        dict(entry) for entry in sample_states[i]["applied_attacks"]
+                    ]
 
             evasion_rate = evasions / num_valid
             detection_rate = 1.0 - evasion_rate
@@ -846,6 +1011,7 @@ def run_single_analysis(
         "attacker_key": att_key,
         "attacker_display_name": att_spec["display_name"],
         "attacker_category": att_spec.get("category", "unknown"),
+        "constituent_attacks": att_spec.get("constituent_attacks", [att_key]),
         "num_samples_requested": num_samples,
         "num_samples_valid": num_valid,
         "seed": seed,
@@ -861,6 +1027,11 @@ def run_single_analysis(
     }
     with open(config_json_path, "w", encoding="utf-8") as f:
         json.dump(run_config, f, indent=2)
+
+    if attack_attribution_records:
+        attribution_path = results_dir / "attack_attribution.json"
+        with open(attribution_path, "w", encoding="utf-8") as f:
+            json.dump(attack_attribution_records, f, indent=2)
 
     # ------------------------------------------------------------------
     # Plotting with Variance

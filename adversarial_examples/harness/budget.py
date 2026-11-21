@@ -11,6 +11,7 @@ class PerturbationBudget:
         self._consumed = 0
         self.evaluated_word_indices: list[int] = []
         self.computed_word_ranking: list[tuple[int, float]] | None = None
+        self.applied_attacks: list[dict] = []
 
     @property
     def remaining(self) -> int:

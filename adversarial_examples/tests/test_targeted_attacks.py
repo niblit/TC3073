@@ -27,6 +27,10 @@ from harness.attacks import (
     DOMWrapperAttack,
     HomoglyphSubstitutionAttack,
     compute_word_ranking,
+    CombinedAttack,
+    PerWordBestOfKAttack,
+    TextFoolerAttack,
+    ATTACK_PRIORITY_ORDER,
 )
 
 
@@ -466,3 +470,276 @@ class TestWordRankingSupport:
 
         # Greedy incremental output after Step 2 must match the 2-edit from-scratch output
         assert step2_text == scratch_result
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Combined Attack (Strategy A — Per-Word Best-of-K / Multi-Attack Argmax)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestCombinedBestOfKAttack:
+    """Verify Per-Word Best-of-K ('Multi-Attack Argmax') combined attack behavior."""
+
+    def test_inheritance_and_oracle_requirement(self):
+        attack = CombinedAttack()
+        alias_attack = PerWordBestOfKAttack()
+        assert isinstance(attack, TargetedStructureTransformation)
+        assert isinstance(attack, StructureTransformation)
+        assert isinstance(alias_attack, CombinedAttack)
+
+        budget = PerturbationBudget(max_edits=2)
+        with pytest.raises(ValueError, match="requires a target_model_oracle"):
+            attack.transform("Urgent verify account", budget)
+
+    def test_priority_hierarchy_ordering_and_deduplication(self):
+        """
+        Constituent attacks must be deduplicated and ordered deterministically
+        according to the 6-tier priority hierarchy regardless of input order.
+        """
+        attack = CombinedAttack(
+            attacks=[
+                "html_tag",
+                "sender_header",
+                "zero_width",
+                "homoglyph",
+                "textfooler",
+                "html_entity",
+                "dom_wrapper",
+                "zw",  # duplicate alias for zero_width
+                "confusables",  # duplicate alias for homoglyph
+            ]
+        )
+        assert attack.constituent_keys == [
+            "textfooler",     # Tier 1
+            "homoglyph",      # Tier 2
+            "zero_width",     # Tier 2
+            "html_entity",    # Tier 3
+            "html_tag",       # Tier 4
+            "dom_wrapper",    # Tier 5
+            "sender_header",  # Tier 6
+        ]
+
+    def test_non_flip_argmax_confidence_drop_single_word(self):
+        """
+        When no candidate flips the label on a word, CombinedAttack must evaluate
+        candidates across all K constituent attacks and commit ONLY the single
+        perturbation with the largest confidence drop (consuming 1 edit, never
+        stacking multiple attacks onto the same word).
+        """
+        text = "verify password"
+        # Ranking puts word 1 ("password") first
+        ranking = [(1, 0.90), (0, 0.10)]
+
+        def oracle(t):
+            # HTML entity encoding on 'password' -> biggest confidence drop (0.95 -> 0.55)
+            if "&#" in t:
+                return ("phishing", 0.55)
+            # Homoglyph on 'password' -> moderate drop (0.95 -> 0.72)
+            if "\u0430" in t or "\u043e" in t or "\u0440" in t or "\u0455" in t:
+                return ("phishing", 0.72)
+            # Zero-width on 'password' -> small drop (0.95 -> 0.84)
+            if any(zw in t for zw in ["\u200b", "\u200c", "\u200d", "\u2060"]):
+                return ("phishing", 0.84)
+            # HTML tag on 'password' -> small drop (0.95 -> 0.80)
+            if "<" in t:
+                return ("phishing", 0.80)
+            return ("phishing", 0.95)
+
+        attack = CombinedAttack(
+            target_model_oracle=oracle,
+            attacks=["homoglyph", "zero_width", "html_entity", "html_tag"],
+        )
+        budget = PerturbationBudget(max_edits=1)
+        result = attack.transform(text, budget, word_ranking=ranking)
+
+        assert budget.consumed == 1
+        res_words = result.split()
+        assert res_words[0] == "verify"
+        # Only html_entity should be applied to "password" (no stacked tags, homoglyphs, or zero-width chars)
+        assert "&#" in res_words[1]
+        assert not any(zw in res_words[1] for zw in ["\u200b", "\u200c", "\u200d", "\u2060"])
+        assert "<span>" not in res_words[1]
+        assert not any("\u0400" <= ch <= "\u04ff" for ch in res_words[1])
+        assert len(budget.applied_attacks) == 1
+        assert budget.applied_attacks[0]["attack"] == "html_entity"
+        assert budget.applied_attacks[0]["flipped"] is False
+        assert budget.applied_attacks[0]["conf_drop"] == pytest.approx(0.40)
+
+    def test_multi_flip_selects_candidate_with_biggest_impact(self):
+        """
+        When 2 or more different constituent attacks BOTH flip the oracle's label
+        on the same word, CombinedAttack must NOT stop at the first flip. It must
+        evaluate all K constituent attacks on that word and pick the flip with the
+        biggest impact (highest confidence in the flipped 'benign' label / lowest
+        remaining phishing probability), consume 1 edit, and terminate early.
+        """
+        text = "urgent password verification"
+        # Prioritize index 1 ("password") first, then index 0 ("urgent")
+        ranking = [(1, 0.95), (0, 0.50), (2, 0.20)]
+
+        def oracle(t):
+            # Attack A (Tier 2 homoglyph — evaluated FIRST) flips label with modest benign confidence 0.72
+            if any("\u0400" <= ch <= "\u04ff" for ch in t):
+                return ("benign", 0.72)
+            # Attack B (Tier 2 zero_width — evaluated SECOND) flips label with benign confidence 0.81
+            if any(zw in t for zw in ["\u200b", "\u200c", "\u200d", "\u2060"]):
+                return ("benign", 0.81)
+            # Attack C (Tier 4 html_tag — evaluated LAST) flips label with HIGHEST benign confidence 0.94!
+            if "<span></span>" in t:
+                return ("benign", 0.94)
+            return ("phishing", 0.95)
+
+        attack = CombinedAttack(
+            target_model_oracle=oracle,
+            attacks=["homoglyph", "zero_width", "html_entity", "html_tag"],
+        )
+        budget = PerturbationBudget(max_edits=3)
+        result = attack.transform(text, budget, word_ranking=ranking)
+
+        # Must pick html_tag's candidate ("pass<span></span>word") because 0.94 > 0.81 > 0.72,
+        # consume only 1 edit, and terminate early without touching "urgent" or "verification"!
+        assert budget.consumed == 1
+        assert result == "urgent pass<span></span>word verification"
+        assert len(budget.applied_attacks) == 1
+        assert budget.applied_attacks[0]["attack"] == "html_tag"
+        assert budget.applied_attacks[0]["flipped"] is True
+        assert budget.applied_attacks[0]["flipped_conf"] == pytest.approx(0.94)
+        # Remaining phishing confidence is 1.0 - 0.94 = 0.06 -> conf_drop = 0.95 - 0.06 = 0.89
+        assert budget.applied_attacks[0]["conf_drop"] == pytest.approx(0.89)
+
+    def test_cross_word_complementarity_different_attacks_win_on_different_words(self):
+        """
+        Verify that on word w_0 Attack A wins and is committed, while on word w_1
+        Attack B wins and is committed.
+        """
+        text = "verify password immediately"
+        # Visit word 0 ("verify") first, then word 1 ("password")
+        ranking = [(0, 0.90), (1, 0.80), (2, 0.10)]
+
+        def oracle(t):
+            tokens = t.split()
+            score = 0.95
+            # On word 0 ("verify"): homoglyph Cyrillic 'е' (\u0435) gives -0.20 drop, others give -0.02
+            if len(tokens) >= 1 and "\u0435" in tokens[0]:
+                score -= 0.20
+            elif len(tokens) >= 1 and tokens[0] != "verify":
+                score -= 0.02
+
+            # On word 1 ("password"): zero_width '\u200b' gives -0.22 drop, others give -0.03
+            if len(tokens) >= 2 and "\u200b" in tokens[1]:
+                score -= 0.22
+            elif len(tokens) >= 2 and tokens[1] != "password":
+                score -= 0.03
+
+            return ("phishing", round(score, 4))
+
+        attack = CombinedAttack(
+            target_model_oracle=oracle,
+            attacks=["homoglyph", "zero_width", "html_tag"],
+        )
+        budget = PerturbationBudget(max_edits=2)
+        result = attack.transform(text, budget, word_ranking=ranking)
+
+        assert budget.consumed == 2
+        res_tokens = result.split()
+        # Word 0 mutated by homoglyph ('v\u0435rify')
+        assert "\u0435" in res_tokens[0]
+        # Word 1 mutated by zero_width ('pass\u200bword')
+        assert "\u200b" in res_tokens[1]
+        # Word 2 untouched
+        assert res_tokens[2] == "immediately"
+        assert [e["attack"] for e in budget.applied_attacks] == ["homoglyph", "zero_width"]
+
+    def test_greedy_continuation_with_space_containing_html_tag_matches_from_scratch(self):
+        """
+        Verify that when HTMLTagInjectionAttack injects `<font style="font-size:inherit"></font>`
+        (which contains an internal space) at Greedy Step 1, Step 2 tokenizes with
+        `re.findall(r"(?:<[^>]+>|\\S)+", body)` so word indices do not shift, producing
+        the exact same 2-edit output as a from-scratch 2-edit run.
+        """
+        import re
+        text = "Please verify account password immediately"
+
+        def oracle(t):
+            tokens = re.findall(r"(?:<[^>]+>|\S)+", t)
+            # Single-word deletion queries during word importance computation (len < 5)
+            if len(tokens) < 5:
+                if "verify" not in tokens:
+                    return ("phishing", 0.30)
+                if "password" not in tokens:
+                    return ("phishing", 0.40)
+                return ("phishing", 0.90)
+
+            score = 0.95
+            # Make `<font style="font-size:inherit"></font>` win on "verify" (index 1)
+            if len(tokens) > 1 and '<font style="font-size:inherit"></font>' in tokens[1]:
+                score -= 0.18
+            elif len(tokens) > 1 and tokens[1] != "verify":
+                score -= 0.04
+
+            # Make homoglyph `\u0430` win on "password" (index 3)
+            if len(tokens) > 3 and "\u0430" in tokens[3]:
+                score -= 0.17
+            elif len(tokens) > 3 and tokens[3] != "password":
+                score -= 0.03
+
+            return ("phishing", round(score, 4))
+
+        attack = CombinedAttack(
+            target_model_oracle=oracle,
+            attacks=["homoglyph", "zero_width", "html_tag"],
+        )
+
+        # 1. From-scratch 2-edit run
+        scratch_budget = PerturbationBudget(max_edits=2)
+        scratch_result = attack.transform(text, scratch_budget)
+        assert scratch_budget.consumed == 2
+        assert '<font style="font-size:inherit"></font>' in scratch_result
+        assert "p\u0430ssword" in scratch_result
+
+        # 2. Greedy Step 1 (1 edit -> injects `<font style="font-size:inherit"></font>` into "verify")
+        step1_budget = PerturbationBudget(max_edits=1)
+        step1_text = attack.transform(text, step1_budget)
+        assert step1_budget.consumed == 1
+        assert '<font style="font-size:inherit"></font>' in step1_text
+
+        # 3. Greedy Step 2 (1 edit starting from step1_text, using remaining word ranking)
+        visited = set(step1_budget.evaluated_word_indices)
+        remaining_ranking = [
+            item for item in step1_budget.computed_word_ranking
+            if item[0] not in visited
+        ]
+        step2_budget = PerturbationBudget(max_edits=1)
+        step2_text = attack.transform(step1_text, step2_budget, word_ranking=remaining_ranking)
+        assert step2_budget.consumed == 1
+
+        # Greedy 2-step output must match from-scratch 2-edit output character for character
+        assert step2_text == scratch_result
+
+    def test_combine_all_with_envelope_and_word_attacks(self):
+        """
+        Verify that CombinedAttack with `combine_all` (including Tier 5/6 envelope/macro
+        attacks and Tier 1-4 word attacks) preserves RFC 5322 headers and selects
+        the highest-impact mutation across all tiers.
+        """
+        email_text = "From: bad@attacker.com\nSubject: Urgent Alert\n\nPlease verify password now"
+
+        def oracle(t):
+            # Suppose AuthenticationResultsAttack flips with 0.96 benign confidence
+            if "Authentication-Results:" in t and "dkim=pass" in t:
+                return ("benign", 0.96)
+            # While ZeroWidth flips with lower 0.75 benign confidence
+            if "\u200b" in t:
+                return ("benign", 0.75)
+            return ("phishing", 0.92)
+
+        attack = CombinedAttack(target_model_oracle=oracle, attacks="combine_all")
+        budget = PerturbationBudget(max_edits=2)
+        result = attack.transform(email_text, budget, word_ranking=[(2, 0.9), (1, 0.5)])
+
+        assert budget.consumed == 1
+        assert "Authentication-Results:" in result
+        assert "Please verify password now" in result
+        assert budget.applied_attacks[0]["attack"] == "auth_results"
+        assert budget.applied_attacks[0]["flipped"] is True
+        assert budget.applied_attacks[0]["flipped_conf"] == pytest.approx(0.96)
+

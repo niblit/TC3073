@@ -19,6 +19,15 @@ from harness.attacks import (
     DOMWrapperAttack,
     HomoglyphSubstitutionAttack,
     compute_word_ranking,
+    CombinedAttack,
+    PerWordBestOfKAttack,
+    ATTACK_PRIORITY_ORDER,
+    DEFAULT_COMBINED_ATTACKS,
+    ALL_COMBINED_ATTACKS,
+)
+from harness.attacks.combined_attack import (
+    CombinedAttack as ModCombinedAttack,
+    PerWordBestOfKAttack as ModPerWordBestOfKAttack,
 )
 from harness.attacks.content_attacks import (
     TextFoolerAttack as ContentTextFoolerAttack,
@@ -72,9 +81,17 @@ def test_attacks_module_exports():
         "DOMWrapperAttack",
         "HomoglyphSubstitutionAttack",
         "compute_word_ranking",
+        "CombinedAttack",
+        "PerWordBestOfKAttack",
+        "ATTACK_PRIORITY_ORDER",
+        "DEFAULT_COMBINED_ATTACKS",
+        "ALL_COMBINED_ATTACKS",
     ]
     for export_name in expected_exports:
         assert export_name in harness.attacks.__all__
+    assert CombinedAttack is ModCombinedAttack
+    assert PerWordBestOfKAttack is ModPerWordBestOfKAttack
+    assert issubclass(PerWordBestOfKAttack, CombinedAttack)
 
 
 def test_html_comment_injection():

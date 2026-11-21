@@ -33,7 +33,7 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 def get_word_tokens_with_spaces(text: str) -> list[str]:
     """Tokenize text into words along with their trailing whitespace to preserve formatting while diffing clean words."""
-    tokens = re.findall(r"\S+\s*", text)
+    tokens = re.findall(r"(?:<[^>]+>|\S)+\s*", text)
     if not tokens and text:
         return [text]
     return tokens
@@ -143,9 +143,9 @@ def resolve_results_directory(path_str: str) -> tuple[Path, list[Path]]:
     if subdirs_with_results:
         return p, sorted(subdirs_with_results, key=lambda d: d.name)
 
-    # Case 3: Direct single detector folder
+    # Case 3: Direct single detector/run folder
     if (p / "raw_results.csv").exists():
-        return p.parent, [p]
+        return p, [p]
 
     raise ValueError(f"No benchmark results (raw_results.csv) found under {p}")
 
@@ -164,6 +164,24 @@ ATTACK_CATEGORY_MAP = {
     "x_header": "metadata",
     "subject_metadata": "metadata",
     "timestamp": "metadata",
+    "combined": "combined",
+    "combine_all": "combined",
+}
+
+CONSTITUENT_ATTACK_INFO = {
+    "textfooler": {"label": "TextFooler", "tier": 1, "category": "content"},
+    "homoglyph": {"label": "Homoglyph Substitution", "tier": 2, "category": "structure"},
+    "zero_width": {"label": "Zero-Width Injection", "tier": 2, "category": "structure"},
+    "html_entity": {"label": "HTML Entity Encoding", "tier": 3, "category": "structure"},
+    "html_tag": {"label": "HTML Tag Injection", "tier": 4, "category": "structure"},
+    "dom_wrapper": {"label": "DOM Wrapper", "tier": 5, "category": "structure"},
+    "html_comment": {"label": "HTML Comment Injection", "tier": 5, "category": "structure"},
+    "sender_header": {"label": "Sender Header", "tier": 6, "category": "metadata"},
+    "auth_results": {"label": "Authentication Results", "tier": 6, "category": "metadata"},
+    "received_routing": {"label": "Received Routing", "tier": 6, "category": "metadata"},
+    "x_header": {"label": "X-Header Injection", "tier": 6, "category": "metadata"},
+    "subject_metadata": {"label": "Subject Metadata", "tier": 6, "category": "metadata"},
+    "timestamp": {"label": "Timestamp Spoofing", "tier": 6, "category": "metadata"},
 }
 
 KNOWN_DETECTORS = {
@@ -173,14 +191,120 @@ KNOWN_DETECTORS = {
 }
 
 
+def _parse_constituent_keys_from_att_key(att_key: str) -> list[str]:
+    """Extracts constituent attack keys from a canonical or preset attacker key."""
+    if att_key == "combine_all":
+        return list(CONSTITUENT_ATTACK_INFO.keys())
+    if att_key == "combined":
+        return ["homoglyph", "zero_width", "html_entity", "html_tag"]
+    if att_key.startswith("combined_"):
+        rem = att_key[len("combined_"):]
+        by_len = sorted(CONSTITUENT_ATTACK_INFO.keys(), key=len, reverse=True)
+        parsed = []
+        while rem:
+            matched = None
+            for k in by_len:
+                if rem == k or rem.startswith(k + "_"):
+                    matched = k
+                    break
+            if matched is None:
+                break
+            parsed.append(matched)
+            rem = rem[len(matched):].lstrip("_")
+        if parsed and not rem:
+            return parsed
+    if "+" in att_key:
+        parts = [p.strip() for p in att_key.split("+") if p.strip()]
+        return [p for p in parts if p in CONSTITUENT_ATTACK_INFO]
+    if att_key in CONSTITUENT_ATTACK_INFO:
+        return [att_key]
+    return []
+
+
+def classify_perturbation_attack(
+    orig_token: str,
+    pert_token: str,
+    fallback_attacker_id: str = "unknown",
+) -> str:
+    """
+    Deterministically classifies which constituent attack algorithm produced a
+    token/header/DOM transformation `orig_token -> pert_token`.
+    """
+    orig = orig_token or ""
+    pert = pert_token or ""
+
+    # 1. Zero-Width Unicode Injection
+    zw_chars = ("\u200b", "\u200c", "\u200d", "\u2060", "\ufeff")
+    if any(zw in pert and zw not in orig for zw in zw_chars):
+        return "zero_width"
+
+    # 2. Numeric HTML Entity Encoding
+    if re.search(r"&#(?:x[0-9a-fA-F]+|\d+);", pert) and not re.search(
+        r"&#(?:x[0-9a-fA-F]+|\d+);", orig
+    ):
+        return "html_entity"
+
+    # 3. HTML Comment Injection
+    if "<!--" in pert and "<!--" not in orig:
+        return "html_comment"
+
+    # 4. Macro DOM Wrapper
+    if re.search(
+        r"<(?:table|article|section|blockquote|div)\b", pert, re.IGNORECASE
+    ) and not re.search(
+        r"<(?:table|article|section|blockquote|div)\b", orig, re.IGNORECASE
+    ):
+        return "dom_wrapper"
+
+    # 5. Inline HTML Tag Injection
+    if re.search(
+        r"</?(?:span|b|i|wbr|font|abbr)\b[^>]*>", pert, re.IGNORECASE
+    ) and not re.search(
+        r"</?(?:span|b|i|wbr|font|abbr)\b[^>]*>", orig, re.IGNORECASE
+    ):
+        return "html_tag"
+
+    # 6. Cyrillic Homoglyph Substitution
+    if any("\u0400" <= ch <= "\u04ff" for ch in pert) and not any(
+        "\u0400" <= ch <= "\u04ff" for ch in orig
+    ):
+        return "homoglyph"
+
+    # 7. RFC 5322 Envelope Metadata Headers
+    combined_str = f"{orig} {pert}"
+    if re.search(r"\b(?:From|Reply-To|Return-Path|Sender):", combined_str):
+        return "sender_header"
+    if re.search(
+        r"\b(?:Authentication-Results|Received-SPF|ARC-Authentication-Results):",
+        combined_str,
+    ):
+        return "auth_results"
+    if re.search(r"\bReceived:\s*from\b", combined_str):
+        return "received_routing"
+    if re.search(
+        r"\bX-(?:Spam|Microsoft-Antispam|Forefront|Virus-Scanned|Barracuda|IronPort|MS-Exchange)",
+        combined_str,
+    ):
+        return "x_header"
+    if re.search(r"\bSubject:", combined_str):
+        return "subject_metadata"
+    if re.search(r"\bDate:", combined_str):
+        return "timestamp"
+
+    # 8. Semantic Content Synonym Substitution or Single-Attack Fallback
+    if fallback_attacker_id in CONSTITUENT_ATTACK_INFO:
+        return fallback_attacker_id
+    return "textfooler"
+
+
 def _infer_detector_and_attacker(config: dict, folder_name: str) -> dict:
     """
     Extracts normalized detector identity, attacker identity, and taxonomy
     category from `run_config.json` and folder name (supporting both legacy
-    single-attacker and multi-detector × multi-attacker runs).
+    single-attacker, combined Best-of-K, and multi-detector × multi-attacker runs).
     """
     att_key = str(config.get("attacker_key", "")).strip() or "unknown"
-    att_name = str(config.get("attacker_display_name", "")).strip() or att_key.replace("_", " ").title()
+    raw_att_name = str(config.get("attacker_display_name", "")).strip()
 
     base_det_key = str(config.get("base_detector_key", "")).strip()
     base_det_name = str(config.get("base_detector_display_name", "")).strip()
@@ -209,9 +333,34 @@ def _infer_detector_and_attacker(config: dict, folder_name: str) -> dict:
         else:
             base_det_name = raw_det_name
 
+    if raw_att_name and raw_att_name != "Adversarial Attacker":
+        att_name = raw_att_name
+    elif " - " in raw_det_name:
+        att_name = raw_det_name.split(" - ", 1)[1].strip()
+    elif att_key == "combine_all":
+        att_name = "Combined All Attacks (Best-of-K)"
+    elif att_key == "combined":
+        att_name = "Combined Structure Attack (Best-of-K)"
+    elif att_key.startswith("combined_"):
+        c_keys = _parse_constituent_keys_from_att_key(att_key)
+        if c_keys:
+            c_labels = [CONSTITUENT_ATTACK_INFO[k]["label"] for k in c_keys]
+            att_name = f"Combined ({' + '.join(c_labels)})"
+        else:
+            att_name = att_key.replace("_", " ").title()
+    else:
+        att_name = att_key.replace("_", " ").title()
+
     category = str(config.get("attacker_category", "")).strip().lower()
     if not category or category == "unknown":
-        category = ATTACK_CATEGORY_MAP.get(att_key, "other")
+        if (
+            att_key in ("combined", "combine_all")
+            or att_key.startswith("combined_")
+            or "+" in att_key
+        ):
+            category = "combined"
+        else:
+            category = ATTACK_CATEGORY_MAP.get(att_key, "other")
 
     return {
         "detector_id": base_det_key,
@@ -275,6 +424,20 @@ def load_detector_run(detector_dir: Path) -> dict:
         with open(curve_png, "rb") as f:
             curve_b64 = "data:image/png;base64," + base64.b64encode(f.read()).decode("utf-8")
 
+    # 3.5 Optional Recorded Per-Edit Attack Attribution Trace
+    attribution_file = detector_dir / "attack_attribution.json"
+    recorded_attributions = {}
+    if attribution_file.exists():
+        try:
+            with open(attribution_file, "r", encoding="utf-8") as f:
+                recorded_attributions = json.load(f)
+        except Exception:
+            recorded_attributions = {}
+
+    configured_constituents = config.get("constituent_attacks")
+    if not configured_constituents or not isinstance(configured_constituents, list):
+        configured_constituents = _parse_constituent_keys_from_att_key(identity["attacker_id"])
+
     # 4. Raw Results
     raw_file = detector_dir / "raw_results.csv"
     raw_rows = []
@@ -296,6 +459,8 @@ def load_detector_run(detector_dir: Path) -> dict:
                 orig_b64 = r.get("original_text_b64", "")
                 if orig_b64:
                     orig_decoded = base64.b64decode(orig_b64).decode("utf-8", errors="replace")
+                elif r.get("original_text"):
+                    orig_decoded = str(r.get("original_text", ""))
                 else:
                     orig_decoded = f"[Sample #{s_idx} text not recorded in legacy CSV]"
                 sample_texts_cache[s_idx] = orig_decoded
@@ -305,6 +470,8 @@ def load_detector_run(detector_dir: Path) -> dict:
             pert_b64 = r.get("perturbed_text_b64", "")
             if pert_b64:
                 pert_text = base64.b64decode(pert_b64).decode("utf-8", errors="replace")
+            elif r.get("perturbed_text"):
+                pert_text = str(r.get("perturbed_text", ""))
             else:
                 pert_text = orig_text
 
@@ -320,6 +487,87 @@ def load_detector_run(detector_dir: Path) -> dict:
             pert_conf = float(r.get("perturbed_confidence", 0.0))
             conf_drop = orig_conf - pert_conf
 
+            # Attribute each edit to a constituent attack (using recorded oracle trace if
+            # available, otherwise deterministically classifying each diff substitution)
+            trace_key = f"{b_val}_{s_idx}"
+            rec_trace = recorded_attributions.get(trace_key)
+            attack_edits = []
+
+            if rec_trace and isinstance(rec_trace, list):
+                for entry in rec_trace:
+                    a_key = entry.get("attack", "unknown")
+                    a_info = CONSTITUENT_ATTACK_INFO.get(
+                        a_key, {"label": a_key.replace("_", " ").title(), "tier": 6, "category": "other"}
+                    )
+                    attack_edits.append({
+                        "attack": a_key,
+                        "attack_label": entry.get("attack_label", a_info["label"]),
+                        "tier": entry.get("tier", a_info["tier"]),
+                        "orig": entry.get("orig_token", ""),
+                        "pert": entry.get("pert_token", ""),
+                        "conf_drop": round(float(entry.get("conf_drop", 0.0)), 4),
+                        "flipped": bool(entry.get("flipped", False)),
+                        "word_idx": entry.get("word_idx"),
+                    })
+
+            # Annotate diff substitutions with constituent attack identity & impact
+            per_sub_drop = round(conf_drop / len(subs), 4) if subs else 0.0
+            trace_by_pert = {e["pert"]: e for e in attack_edits if e.get("pert")}
+            for sub_idx, sub in enumerate(subs):
+                matched_edit = trace_by_pert.get(sub["pert"])
+                if matched_edit:
+                    a_key = matched_edit["attack"]
+                    a_lbl = matched_edit["attack_label"]
+                    a_tier = matched_edit["tier"]
+                    s_drop = matched_edit["conf_drop"]
+                    s_flip = matched_edit["flipped"]
+                else:
+                    a_key = classify_perturbation_attack(
+                        sub["orig"], sub["pert"], fallback_attacker_id=identity["attacker_id"]
+                    )
+                    a_info = CONSTITUENT_ATTACK_INFO.get(
+                        a_key, {"label": a_key.replace("_", " ").title(), "tier": 6, "category": "other"}
+                    )
+                    a_lbl = a_info["label"]
+                    a_tier = a_info["tier"]
+                    s_drop = per_sub_drop
+                    s_flip = bool(evaded == 1 and sub_idx == len(subs) - 1 and not attack_edits)
+
+                sub["attack"] = a_key
+                sub["attack_label"] = a_lbl
+                sub["tier"] = a_tier
+                sub["conf_drop"] = s_drop
+                sub["flipped"] = s_flip
+
+                if not rec_trace:
+                    attack_edits.append({
+                        "attack": a_key,
+                        "attack_label": a_lbl,
+                        "tier": a_tier,
+                        "orig": sub["orig"],
+                        "pert": sub["pert"],
+                        "conf_drop": s_drop,
+                        "flipped": s_flip,
+                        "word_idx": None,
+                    })
+
+            attacks_used = []
+            attack_counts = {}
+            attack_impacts = {}
+            flip_attack = None
+
+            for ed in attack_edits:
+                ak = ed["attack"]
+                if ak not in attacks_used:
+                    attacks_used.append(ak)
+                attack_counts[ak] = attack_counts.get(ak, 0) + 1
+                attack_impacts[ak] = round(attack_impacts.get(ak, 0.0) + float(ed.get("conf_drop", 0.0)), 4)
+                if ed.get("flipped"):
+                    flip_attack = ak
+
+            if evaded == 1 and flip_attack is None and attacks_used:
+                flip_attack = attacks_used[-1]
+
             raw_rows.append({
                 "budget": b_val,
                 "sample_idx": s_idx,
@@ -330,13 +578,18 @@ def load_detector_run(detector_dir: Path) -> dict:
                 "conf_drop": round(conf_drop, 4),
                 "evaded": evaded,
                 "real_budget_consumed": int(float(r.get("real_budget_consumed", w_changed))),
-                "success": r.get("transformation_success", "true").strip().lower() == "true",
+                "success": str(r.get("transformation_success", r.get("success", "true"))).strip().lower() == "true",
                 "words_changed": w_changed,
                 "chunks": chunks,
                 "subs": subs,
                 "patch": patch,
                 "orig_text": orig_text,
-                "pert_text": pert_text
+                "pert_text": pert_text,
+                "attacks_used": attacks_used,
+                "attack_counts": attack_counts,
+                "attack_impacts": attack_impacts,
+                "flip_attack": flip_attack,
+                "attack_edits": attack_edits,
             })
 
     # Summary Statistics
@@ -358,6 +611,61 @@ def load_detector_run(detector_dir: Path) -> dict:
 
     top_subs = sorted(sub_freq.items(), key=lambda x: x[1], reverse=True)[:15]
 
+    # Compute Constituent Attack Breakdown (at max budget step per sample + across all iterations)
+    latest_row_per_sample = {}
+    for r in raw_rows:
+        s_idx = r["sample_idx"]
+        if s_idx not in latest_row_per_sample or r["budget"] >= latest_row_per_sample[s_idx]["budget"]:
+            latest_row_per_sample[s_idx] = r
+
+    all_candidate_keys = []
+    for k in configured_constituents:
+        if k not in all_candidate_keys:
+            all_candidate_keys.append(k)
+    for r in raw_rows:
+        for k in r["attacks_used"]:
+            if k not in all_candidate_keys:
+                all_candidate_keys.append(k)
+
+    final_rows = list(latest_row_per_sample.values())
+    total_final_edits = sum(
+        sum(r["attack_counts"].values()) for r in final_rows
+    )
+    total_flips = sum(1 for r in final_rows if r["evaded"] == 1)
+
+    attack_breakdown = []
+    for ak in all_candidate_keys:
+        ainfo = CONSTITUENT_ATTACK_INFO.get(
+            ak, {"label": ak.replace("_", " ").title(), "tier": 6, "category": "other"}
+        )
+        edit_count = sum(r["attack_counts"].get(ak, 0) for r in final_rows)
+        iter_edit_count = sum(r["attack_counts"].get(ak, 0) for r in raw_rows)
+        samples_affected = sum(1 for r in final_rows if r["attack_counts"].get(ak, 0) > 0)
+        total_drop = sum(r["attack_impacts"].get(ak, 0.0) for r in final_rows)
+        mean_drop_per_edit = (total_drop / edit_count) if edit_count > 0 else 0.0
+        flips_caused = sum(1 for r in final_rows if r["evaded"] == 1 and r["flip_attack"] == ak)
+
+        attack_breakdown.append({
+            "attack_id": ak,
+            "attack_label": ainfo["label"],
+            "tier": ainfo["tier"],
+            "category": ainfo["category"],
+            "edit_count": edit_count,
+            "edit_share_pct": round((edit_count / total_final_edits * 100), 1) if total_final_edits > 0 else 0.0,
+            "total_iteration_edits": iter_edit_count,
+            "samples_affected": samples_affected,
+            "sample_coverage_pct": round((samples_affected / total_valid * 100), 1) if total_valid > 0 else 0.0,
+            "mean_conf_drop_pct": round(mean_drop_per_edit * 100, 2),
+            "total_conf_drop_pct": round(total_drop * 100, 2),
+            "flips_caused": flips_caused,
+            "flip_share_pct": round((flips_caused / total_flips * 100), 1) if total_flips > 0 else 0.0,
+        })
+
+    attack_breakdown.sort(
+        key=lambda x: (x["edit_count"], x["flips_caused"], x["total_conf_drop_pct"], -x["tier"]),
+        reverse=True,
+    )
+
     return {
         "key": config.get("detector_key", detector_dir.name),
         "name": config.get("detector_display_name", detector_dir.name.replace("_", " ").title()),
@@ -366,6 +674,8 @@ def load_detector_run(detector_dir: Path) -> dict:
         "attacker_id": identity["attacker_id"],
         "attacker_label": identity["attacker_label"],
         "attack_category": identity["attack_category"],
+        "constituent_attacks": configured_constituents,
+        "attack_breakdown": attack_breakdown,
         "config": config,
         "metrics": metrics,
         "curve_b64": curve_b64,
@@ -384,7 +694,8 @@ def load_detector_run(detector_dir: Path) -> dict:
             "mean_confidence_drop": round(final_metric.get("mean_confidence_drop", 0.0) * 100, 1),
             "avg_budget_consumed": round(final_metric.get("mean_real_budget_consumed", 0.0), 1),
             "total_failed_transforms": sum(1 for r in raw_rows if not r["success"]),
-            "top_substitutions": top_subs
+            "top_substitutions": top_subs,
+            "attack_breakdown": attack_breakdown,
         }
     }
 
@@ -569,6 +880,43 @@ def generate_summary_tables(base_dir: Path, detectors_data: list[dict]) -> tuple
     avg_cols.append(f"{f'{overall_ev:5.1f}% ({-overall_drp:+6.2f}%)':22s}")
     lines.append(" | ".join(avg_cols))
     lines.append("=" * 110)
+
+    # Combined Attack Constituent Breakdown Section
+    combined_runs = [
+        d for d in detectors_data
+        if d.get("attack_category") == "combined" or len(d.get("attack_breakdown", [])) > 1
+    ]
+    if combined_runs:
+        lines.append("\n" + "=" * 110)
+        lines.append("COMBINED ATTACK CONSTITUENT BREAKDOWN (Frequency, Sample Coverage, ΔConf Impact & Flips)")
+        lines.append("=" * 110)
+        for crun in combined_runs:
+            total_s = crun["summary"]["total_samples"]
+            lines.append(
+                f"\nRun: {crun['detector_label']} — {crun['attacker_label']} "
+                f"(Evasion: {crun['summary']['final_evasion_rate']:.1f}%, "
+                f"Mean ΔConf: -{crun['summary']['mean_confidence_drop']:.1f}%)"
+            )
+            lines.append("-" * 110)
+            c_hdr = (
+                f"{'Constituent Attack':26s} | {'Tier':6s} | {'Edits (Share)':16s} | "
+                f"{'Samples Used':16s} | {'Mean ΔConf/Edit':15s} | {'Total ΔConf':12s} | {'Label Flips':14s}"
+            )
+            lines.append(c_hdr)
+            lines.append("-" * 110)
+            for b in crun.get("attack_breakdown", []):
+                if b["edit_count"] == 0 and b["total_iteration_edits"] == 0 and len(crun.get("attack_breakdown", [])) > 6:
+                    continue
+                edits_str = f"{b['edit_count']:4d} ({b['edit_share_pct']:5.1f}%)"
+                samp_str = f"{b['samples_affected']:2d}/{total_s:<2d} ({b['sample_coverage_pct']:5.1f}%)"
+                mdrop_str = f"{-b['mean_conf_drop_pct']:+7.2f}%"
+                tdrop_str = f"{-b['total_conf_drop_pct']:+7.2f}%"
+                flip_str = f"{b['flips_caused']:3d} ({b['flip_share_pct']:5.1f}%)"
+                lines.append(
+                    f"{b['attack_label'][:26]:26s} | Tier {b['tier']:1d} | {edits_str:16s} | "
+                    f"{samp_str:16s} | {mdrop_str:>15s} | {tdrop_str:>12s} | {flip_str:14s}"
+                )
+            lines.append("-" * 110)
 
     summary_text = "\n".join(lines) + "\n"
     (base_dir / "summary_table.txt").write_text(summary_text, encoding="utf-8")
@@ -880,6 +1228,50 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       background: rgba(245, 158, 11, 0.16);
       color: #fcd34d;
       border: 1px solid rgba(245, 158, 11, 0.35);
+    }
+    .cat-combined {
+      background: rgba(16, 185, 129, 0.18);
+      color: #34d399;
+      border: 1px solid rgba(16, 185, 129, 0.42);
+    }
+    .attack-vector-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 8px;
+      border-radius: 4px;
+      background: rgba(6, 182, 212, 0.12);
+      color: #67e8f9;
+      border: 1px solid rgba(6, 182, 212, 0.30);
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .attack-vector-chip:hover {
+      background: rgba(6, 182, 212, 0.24);
+      border-color: var(--accent-cyan);
+      color: #fff;
+    }
+    .attack-vector-chip.is-flip-vector {
+      background: rgba(244, 63, 94, 0.18);
+      color: #fda4af;
+      border-color: rgba(244, 63, 94, 0.45);
+    }
+    .freq-bar-track {
+      width: 110px;
+      height: 7px;
+      background: rgba(255, 255, 255, 0.07);
+      border-radius: 4px;
+      overflow: hidden;
+      display: inline-block;
+      vertical-align: middle;
+      margin-left: 8px;
+    }
+    .freq-bar-fill {
+      height: 100%;
+      border-radius: 4px;
+      background: linear-gradient(90deg, var(--accent-primary), var(--accent-cyan));
     }
 
     /* 2D Attack x Detector Heatmap Matrix */
@@ -1885,6 +2277,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
           <select id="matrixCategorySelect" class="filter-select" onchange="renderMatrix()" title="Filter rows by attack taxonomy category">
             <option value="all">Category: All Types</option>
+            <option value="combined">Combined Attacks (Best-of-K)</option>
             <option value="structure">Structure Attacks</option>
             <option value="content">Content Attacks</option>
             <option value="metadata">Metadata Attacks</option>
@@ -1964,6 +2357,34 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <tbody id="comparisonTableBody">
             <!-- Injected via JS -->
           </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Combined Attack Constituent Telemetry & Impact Breakdown -->
+    <section class="comparison-section" id="combinedStatsSection" style="display: none;">
+      <div class="section-header" style="flex-wrap: wrap; gap: 10px;">
+        <div>
+          <h2 class="section-title" id="combinedStatsTitle">Combined Attack Constituent Telemetry &amp; Impact Breakdown</h2>
+          <p class="kpi-subtext" id="combinedStatsSubtitle">Per-attack selection frequency, sample coverage, confidence erosion impact (-&Delta;Conf), and label-flip attribution across Best-of-K evaluations. Click any constituent attack to filter samples below.</p>
+        </div>
+      </div>
+      <div class="insights-banner" id="combinedHighlightsBanner" style="margin-bottom: 16px;"></div>
+      <div class="comparison-table-wrapper">
+        <table class="data-table" id="combinedStatsTable">
+          <thead>
+            <tr>
+              <th>Rank</th>
+              <th>Constituent Attack Vector</th>
+              <th>Priority Tier</th>
+              <th>Edits Selected (Frequency Share)</th>
+              <th>Samples Used (Coverage)</th>
+              <th>Mean &Delta;Conf / Edit</th>
+              <th>Total &Delta;Conf Impact</th>
+              <th>Label Flips Caused (Share)</th>
+            </tr>
+          </thead>
+          <tbody id="combinedStatsTableBody"></tbody>
         </table>
       </div>
     </section>
@@ -2076,6 +2497,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <!-- Sample ID Filter -->
         <select id="filterSample" class="filter-select" onchange="applyFilters()">
           <option value="all">Sample: All Samples</option>
+          <!-- Injected via JS -->
+        </select>
+
+        <!-- Constituent Attack Filter -->
+        <select id="filterConstituentAttack" class="filter-select" onchange="applyFilters()">
+          <option value="all">Vector Used: All Attacks</option>
           <!-- Injected via JS -->
         </select>
 
@@ -2289,7 +2716,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const mostResDet = sortedDetsByVuln[sortedDetsByVuln.length - 1];
 
       // 4. Category Breakdown
-      const categories = ['structure', 'content', 'metadata'];
+      const categories = ['combined', 'structure', 'content', 'metadata'];
       const catStats = categories.map(cat => {
         const catRuns = BENCHMARK_DATA.filter(r => r.attack_category === cat);
         const avgEv = catRuns.length ? (catRuns.reduce((s, r) => s + r.summary.final_evasion_rate, 0) / catRuns.length) : 0;
@@ -2679,6 +3106,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       renderDimensionNav();
       renderKPICards();
       renderComparisonTable();
+      renderCombinedStatsSection();
       populateTimelineRunSelector();
       renderTimelineGrid();
       updateStaticChartImage();
@@ -2689,6 +3117,175 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         const navEl = document.getElementById('detectorNav');
         if (navEl) navEl.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }
+    }
+
+    function filterByConstituentAttack(attKey) {
+      const sel = document.getElementById('filterConstituentAttack');
+      if (sel) {
+        sel.value = attKey;
+        applyFilters();
+        const listEl = document.getElementById('samplesList');
+        if (listEl) listEl.scrollIntoView({ behavior: 'smooth' });
+      }
+    }
+
+    function renderCombinedStatsSection() {
+      const sec = document.getElementById('combinedStatsSection');
+      if (!sec) return;
+
+      const activeRuns = getActiveRuns();
+      const combinedRuns = activeRuns.filter(
+        r => r.attack_category === 'combined' || (r.attack_breakdown && r.attack_breakdown.length > 1)
+      );
+
+      if (combinedRuns.length === 0) {
+        sec.style.display = 'none';
+        return;
+      }
+      sec.style.display = 'block';
+
+      const titleEl = document.getElementById('combinedStatsTitle');
+      const subEl = document.getElementById('combinedStatsSubtitle');
+      const bannerEl = document.getElementById('combinedHighlightsBanner');
+      const tbody = document.getElementById('combinedStatsTableBody');
+
+      if (combinedRuns.length === 1) {
+        const cr = combinedRuns[0];
+        if (titleEl) {
+          titleEl.textContent = `Combined Attack Constituent Telemetry — ${cr.detector_label} vs ${cr.attacker_label}`;
+        }
+        if (subEl) {
+          subEl.textContent = `Per-attack selection frequency, sample coverage, confidence drop impact (-ΔConf), and label-flip attribution at max budget (${cr.summary.total_samples} samples). Click any vector row to filter samples below.`;
+        }
+      } else {
+        if (titleEl) {
+          titleEl.textContent = `Combined Attack Constituent Telemetry (${combinedRuns.length} Combined Runs Aggregated)`;
+        }
+        if (subEl) {
+          subEl.textContent = `Aggregated per-attack selection frequency, sample coverage, confidence drop impact (-ΔConf), and label-flip attribution across ${combinedRuns.length} combined runs.`;
+        }
+      }
+
+      // Aggregate breakdown across active combinedRuns
+      const aggMap = new Map();
+      let totalSamplesAcrossRuns = 0;
+      let totalEditsAcrossRuns = 0;
+      let totalFlipsAcrossRuns = 0;
+
+      combinedRuns.forEach(r => {
+        totalSamplesAcrossRuns += (r.summary.total_samples || 0);
+        totalFlipsAcrossRuns += (r.summary.total_evaded_samples || 0);
+        (r.attack_breakdown || []).forEach(b => {
+          totalEditsAcrossRuns += (b.edit_count || 0);
+          if (!aggMap.has(b.attack_id)) {
+            aggMap.set(b.attack_id, {
+              attack_id: b.attack_id,
+              attack_label: b.attack_label,
+              tier: b.tier || 6,
+              category: b.category || 'structure',
+              edit_count: 0,
+              total_iteration_edits: 0,
+              samples_affected: 0,
+              total_conf_drop_pct: 0,
+              flips_caused: 0,
+            });
+          }
+          const cur = aggMap.get(b.attack_id);
+          cur.edit_count += (b.edit_count || 0);
+          cur.total_iteration_edits += (b.total_iteration_edits || 0);
+          cur.samples_affected += (b.samples_affected || 0);
+          cur.total_conf_drop_pct += (b.total_conf_drop_pct || 0);
+          cur.flips_caused += (b.flips_caused || 0);
+        });
+      });
+
+      const rows = Array.from(aggMap.values()).map(item => ({
+        ...item,
+        edit_share_pct: totalEditsAcrossRuns > 0 ? (item.edit_count / totalEditsAcrossRuns * 100) : 0,
+        sample_coverage_pct: totalSamplesAcrossRuns > 0 ? (item.samples_affected / totalSamplesAcrossRuns * 100) : 0,
+        mean_conf_drop_pct: item.edit_count > 0 ? (item.total_conf_drop_pct / item.edit_count) : 0,
+        flip_share_pct: totalFlipsAcrossRuns > 0 ? (item.flips_caused / totalFlipsAcrossRuns * 100) : 0,
+      })).sort((a, b) => b.edit_count - a.edit_count || b.flips_caused - a.flips_caused || b.total_conf_drop_pct - a.total_conf_drop_pct || a.tier - b.tier);
+
+      // Render KPI highlight callouts
+      if (bannerEl) {
+        bannerEl.innerHTML = '';
+        const activeVectors = rows.filter(x => x.edit_count > 0);
+        if (activeVectors.length > 0) {
+          const topFreq = activeVectors[0];
+          const topImpact = [...activeVectors].sort((a, b) => b.total_conf_drop_pct - a.total_conf_drop_pct)[0];
+          const topFlip = [...activeVectors].sort((a, b) => b.flips_caused - a.flips_caused || b.total_conf_drop_pct - a.total_conf_drop_pct)[0];
+
+          const cards = [
+            {
+              tag: 'Most Selected Constituent Vector',
+              badge: `<span class="meta-tag" style="padding:1px 6px; font-size:10px;">Tier ${topFreq.tier}</span>`,
+              headline: `${escapeHtml(topFreq.attack_label)} — ${topFreq.edit_count} Edits (${topFreq.edit_share_pct.toFixed(1)}%)`,
+              detail: `Applied in <strong>${topFreq.samples_affected} / ${totalSamplesAcrossRuns}</strong> samples (${topFreq.sample_coverage_pct.toFixed(1)}% coverage). Click to filter samples.`,
+              onClick: () => filterByConstituentAttack(topFreq.attack_id)
+            },
+            {
+              tag: 'Highest Cumulative Confidence Impact',
+              badge: `<span class="meta-tag" style="padding:1px 6px; font-size:10px;">Tier ${topImpact.tier}</span>`,
+              headline: `${escapeHtml(topImpact.attack_label)} — -${topImpact.mean_conf_drop_pct.toFixed(2)}% / edit`,
+              detail: `Contributed <strong>-${topImpact.total_conf_drop_pct.toFixed(1)}%</strong> cumulative confidence drop across <strong>${topImpact.edit_count}</strong> winning edits.`,
+              onClick: () => filterByConstituentAttack(topImpact.attack_id)
+            },
+            {
+              tag: 'Top Label-Flipping Vector (Killing Blows)',
+              badge: `<span class="meta-tag" style="padding:1px 6px; font-size:10px;">${totalFlipsAcrossRuns} Total Flips</span>`,
+              headline: topFlip.flips_caused > 0
+                ? `${escapeHtml(topFlip.attack_label)} — ${topFlip.flips_caused} Flips (${topFlip.flip_share_pct.toFixed(1)}%)`
+                : '0 Label Flips Triggered',
+              detail: topFlip.flips_caused > 0
+                ? `Delivered the final label-flipping perturbation in <strong>${topFlip.flips_caused}</strong> of <strong>${totalFlipsAcrossRuns}</strong> evaded sample(s).`
+                : `Active vectors eroded confidence without crossing the 50% decision threshold.`,
+              onClick: () => filterByConstituentAttack(topFlip.attack_id)
+            }
+          ];
+
+          cards.forEach(ic => {
+            const card = document.createElement('div');
+            card.className = 'insight-card';
+            card.innerHTML = `
+              <div class="insight-tag"><span>${ic.tag}</span>${ic.badge}</div>
+              <div class="insight-headline">${ic.headline}</div>
+              <div class="insight-detail">${ic.detail}</div>
+            `;
+            card.onclick = ic.onClick;
+            bannerEl.appendChild(card);
+          });
+        }
+      }
+
+      // Render table rows
+      tbody.innerHTML = '';
+      rows.forEach((b, idx) => {
+        const tr = document.createElement('tr');
+        tr.style.cursor = 'pointer';
+        if (b.edit_count === 0 && b.total_iteration_edits === 0) {
+          tr.style.opacity = '0.55';
+        }
+        tr.innerHTML = `
+          <td><span class="matrix-rank-badge ${b.edit_count > 0 && idx < 3 ? 'top-rank' : ''}">#${idx + 1}</span></td>
+          <td><strong>${escapeHtml(b.attack_label)}</strong> ${catBadgeHtml(b.category)}</td>
+          <td><span class="meta-tag" style="padding:2px 8px; font-size:11px;">Tier ${b.tier}</span></td>
+          <td>
+            <strong>${b.edit_count}</strong> edits <span style="color:var(--text-muted); font-size:12px;">(${b.edit_share_pct.toFixed(1)}%)</span>
+            <span class="freq-bar-track"><span class="freq-bar-fill" style="width:${Math.min(100, b.edit_share_pct).toFixed(1)}%;"></span></span>
+          </td>
+          <td><strong>${b.samples_affected}</strong> / ${totalSamplesAcrossRuns} <span style="color:var(--text-muted); font-size:12px;">(${b.sample_coverage_pct.toFixed(1)}%)</span></td>
+          <td><span style="color:${b.mean_conf_drop_pct > 0 ? '#fda4af' : 'var(--text-muted)'}; font-weight:600;">-${b.mean_conf_drop_pct.toFixed(2)}%</span></td>
+          <td><span style="color:${b.total_conf_drop_pct > 0 ? '#fda4af' : 'var(--text-muted)'};">-${b.total_conf_drop_pct.toFixed(2)}%</span></td>
+          <td>
+            <span class="status-badge ${b.flips_caused > 0 ? 'status-evaded' : 'status-caught'}" style="font-size:11px;">
+              ${b.flips_caused} flips (${b.flip_share_pct.toFixed(1)}%)
+            </span>
+          </td>
+        `;
+        tr.onclick = () => filterByConstituentAttack(b.attack_id);
+        tbody.appendChild(tr);
+      });
     }
 
     // Legacy compatibility helper
@@ -3157,9 +3754,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       });
 
       const allWordCounts = {};
+      const allConstituentVectors = new Map();
       BENCHMARK_DATA.forEach(d => {
         Object.entries(d.sample_word_counts || {}).forEach(([k, v]) => {
           if (allWordCounts[k] === undefined) allWordCounts[k] = v;
+        });
+        (d.attack_breakdown || []).forEach(b => {
+          if (!allConstituentVectors.has(b.attack_id)) {
+            allConstituentVectors.set(b.attack_id, b.attack_label);
+          }
         });
       });
       Object.keys(allWordCounts).map(Number).sort((a,b) => a-b).forEach(idx => {
@@ -3168,6 +3771,17 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         opt.textContent = `Sample #${idx} (${allWordCounts[idx]} words)`;
         sSelect.appendChild(opt);
       });
+
+      const cSelect = document.getElementById('filterConstituentAttack');
+      if (cSelect) {
+        cSelect.innerHTML = '<option value="all">Vector Used: All Attacks</option>';
+        Array.from(allConstituentVectors.entries()).forEach(([ak, albl]) => {
+          const opt = document.createElement('option');
+          opt.value = ak;
+          opt.textContent = `Vector: ${albl}`;
+          cSelect.appendChild(opt);
+        });
+      }
     }
 
     function resetFilters() {
@@ -3175,6 +3789,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       document.getElementById('filterOutcome').value = 'all';
       document.getElementById('filterBudget').value = 'all';
       document.getElementById('filterSample').value = 'all';
+      const cSel = document.getElementById('filterConstituentAttack');
+      if (cSel) cSel.value = 'all';
       document.getElementById('filterMinDrop').value = '0';
       document.getElementById('sortSelect').value = 'evaded_first';
       applyFilters();
@@ -3189,6 +3805,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       const outcome = document.getElementById('filterOutcome').value;
       const bFilter = document.getElementById('filterBudget').value;
       const sFilter = document.getElementById('filterSample').value;
+      const cFilter = document.getElementById('filterConstituentAttack')?.value || 'all';
       const minDrop = parseFloat(document.getElementById('filterMinDrop').value) || 0;
       const sortBy = document.getElementById('sortSelect').value;
 
@@ -3211,6 +3828,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
       filteredRows = sourceRows.filter(r => {
         if (bFilter !== 'all' && Math.abs(r.b - parseFloat(bFilter)) > 0.0001) return false;
         if (sFilter !== 'all' && r.s !== parseInt(sFilter, 10)) return false;
+        if (cFilter !== 'all' && !(r.au || []).includes(cFilter)) return false;
         if (r.cd < minDrop) return false;
 
         if (outcome === 'evaded' && r.ev !== 1) return false;
@@ -3218,9 +3836,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         if (outcome === 'failed' && r.ok) return false;
 
         if (q) {
-          const metaMatch = r.detectorName.toLowerCase().includes(q) || r.attackerName.toLowerCase().includes(q) || r.attackCategory.toLowerCase().includes(q);
+          const metaMatch = r.detectorName.toLowerCase().includes(q)
+            || r.attackerName.toLowerCase().includes(q)
+            || r.attackCategory.toLowerCase().includes(q)
+            || (r.au || []).some(a => a.toLowerCase().includes(q));
           if (!metaMatch) {
-            const subMatch = r.sb.some(s => s.orig.toLowerCase().includes(q) || s.pert.toLowerCase().includes(q));
+            const subMatch = r.sb.some(s =>
+              s.orig.toLowerCase().includes(q)
+              || s.pert.toLowerCase().includes(q)
+              || (s.attack_label && s.attack_label.toLowerCase().includes(q))
+            );
             if (!subMatch) {
               const chunkMatch = r.ch.some(c => c[1].toLowerCase().includes(q) || (c[2] && c[2].toLowerCase().includes(q)));
               if (!chunkMatch) return false;
@@ -3294,6 +3919,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         const actualIdx = startIdx + idx;
 
+        let vectorsStripHtml = '';
+        if (r.au && r.au.length > 0) {
+          const chips = r.au.map(ak => {
+            const cnt = (r.ac && r.ac[ak]) || 1;
+            const imp = (r.ai && r.ai[ak] !== undefined) ? (r.ai[ak] * 100).toFixed(1) : '0.0';
+            const isFlip = isEvaded && r.fa === ak;
+            const editObj = (r.ae || []).find(e => e.attack === ak);
+            const lbl = editObj ? editObj.attack_label : ak.replace(/_/g, ' ');
+            return `<span class="attack-vector-chip ${isFlip ? 'is-flip-vector' : ''}" onclick="filterByConstituentAttack('${ak}')" title="Click to filter samples using ${escapeHtml(lbl)}">
+              ${escapeHtml(lbl)} <strong>&times;${cnt}</strong> <span style="opacity:0.85;">(-${imp}%)</span>${isFlip ? ' <strong>&#9733; FLIP</strong>' : ''}
+            </span>`;
+          }).join(' ');
+          vectorsStripHtml = `
+            <div style="padding: 8px 18px; background: rgba(16, 22, 37, 0.65); border-bottom: 1px solid var(--border-subtle); display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 11px;">
+              <span style="color: var(--text-muted); font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;">Attacks Used:</span>
+              ${chips}
+            </div>
+          `;
+        }
+
         card.innerHTML = `
           <div class="sample-header">
             <div class="sample-title-area">
@@ -3321,7 +3966,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               </div>
             </div>
           </div>
-
+          ${vectorsStripHtml}
           <div class="sample-body">
             ${diffHtml}
           </div>
@@ -3405,14 +4050,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         return `<div class="diff-container" style="color:var(--text-dim); text-align:center;">No word substitutions performed for this budget.</div>`;
       }
 
-      let rows = subs.map((s, idx) => `
+      let rows = subs.map((s, idx) => {
+        const attLbl = s.attack_label || s.attack || 'Perturbation';
+        const tierBadge = s.tier ? `<span style="opacity:0.75; font-size:10px;">(T${s.tier})</span>` : '';
+        const dropVal = s.conf_drop !== undefined ? `-${(s.conf_drop * 100).toFixed(1)}%` : '—';
+        const flipBadge = s.flipped ? ' <strong style="color:var(--evaded-red);">&#9733; FLIP</strong>' : '';
+        return `
         <tr>
           <td style="color:var(--text-dim); width: 40px;">#${idx + 1}</td>
+          <td style="width: 190px;"><span class="attack-vector-chip ${s.flipped ? 'is-flip-vector' : ''}" style="cursor:default;">${escapeHtml(attLbl)} ${tierBadge}</span></td>
           <td><del class="diff-del">${escapeHtml(s.orig || '<none>')}</del></td>
           <td style="width: 30px; text-align: center; color:var(--text-dim);">&rarr;</td>
           <td><ins class="diff-ins">${escapeHtml(s.pert || '<deleted>')}</ins></td>
+          <td style="width: 110px; color:var(--text-muted);">${dropVal}${flipBadge}</td>
         </tr>
-      `).join('');
+      `;
+      }).join('');
 
       return `
         <div class="diff-container" style="padding:0; overflow-y:auto; overflow-x:auto;">
@@ -3420,9 +4073,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <thead>
               <tr>
                 <th>#</th>
+                <th>Attack Vector</th>
                 <th>Original Token</th>
                 <th></th>
                 <th>Adversarial Replacement</th>
+                <th>&Delta;Conf Impact</th>
               </tr>
             </thead>
             <tbody>${rows}</tbody>
@@ -3659,6 +4314,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
       if (mode === 'by_category') {
         const cats = [
+          { id: 'combined', label: 'Combined Attacks (Best-of-K)', color: '#10b981' },
           { id: 'structure', label: 'Structure Attacks', color: '#f43f5e' },
           { id: 'content', label: 'Content Attacks', color: '#6366f1' },
           { id: 'metadata', label: 'Metadata Attacks', color: '#f59e0b' }
@@ -4041,6 +4697,8 @@ def build_html_report(run_title: str, base_dir: Path, detectors_data: list[dict]
             "attacker_id": d.get("attacker_id", d["config"].get("attacker_key", "textfooler")),
             "attacker_label": d.get("attacker_label", d["config"].get("attacker_display_name", "TextFooler")),
             "attack_category": d.get("attack_category", "content"),
+            "constituent_attacks": d.get("constituent_attacks", []),
+            "attack_breakdown": d.get("attack_breakdown", d["summary"].get("attack_breakdown", [])),
             "config": d["config"],
             "metrics": d["metrics"],
             "summary": d["summary"],
@@ -4062,7 +4720,12 @@ def build_html_report(run_title: str, base_dir: Path, detectors_data: list[dict]
                     "wc": r["words_changed"],
                     "ch": r["chunks"],
                     "sb": r["subs"],
-                    "pa": r["patch"]
+                    "pa": r["patch"],
+                    "au": r.get("attacks_used", []),
+                    "ac": r.get("attack_counts", {}),
+                    "ai": r.get("attack_impacts", {}),
+                    "fa": r.get("flip_attack"),
+                    "ae": r.get("attack_edits", []),
                 }
                 for r in d["raw_rows"]
             ]

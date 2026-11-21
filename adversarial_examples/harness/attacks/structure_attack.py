@@ -162,7 +162,7 @@ def compute_word_ranking(
     if not text or not text.strip():
         return []
     headers, body, sep = _separate_headers_body(text)
-    words = body.split()
+    words = re.findall(r"(?:<[^>]+>|\S)+", body)
     if not words:
         return []
     original_label, original_conf = oracle(text)
