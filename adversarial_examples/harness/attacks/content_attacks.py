@@ -300,6 +300,8 @@ class TextFoolerAttack(TargetedContentTransformation):
             importance_ranking = self._compute_word_importance(
                 words, original_label, original_confidence
             )
+            if hasattr(budget, "computed_word_ranking"):
+                budget.computed_word_ranking = list(importance_ranking)
 
         # Current state of the adversarial text (mutated in-place)
         current_words = words.copy()
@@ -309,6 +311,8 @@ class TextFoolerAttack(TargetedContentTransformation):
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:
                 break
+            if hasattr(budget, "evaluated_word_indices"):
+                budget.evaluated_word_indices.append(word_idx)
             # Skip words with -inf importance (stop words / punctuation)
             if importance == float("-inf"):
                 continue

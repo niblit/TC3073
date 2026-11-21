@@ -232,15 +232,19 @@ class ZeroWidthInjectionAttack(TargetedStructureTransformation):
             importance_ranking = _compute_word_importance(
                 oracle, current_words, original_label, original_conf, headers, sep
             )
+            if hasattr(budget, "computed_word_ranking"):
+                budget.computed_word_ranking = list(importance_ranking)
 
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:
                 break
+            if hasattr(budget, "evaluated_word_indices"):
+                budget.evaluated_word_indices.append(word_idx)
             if importance == float("-inf"):
                 continue
 
             target_word = current_words[word_idx]
-            if len(target_word) < 2:
+            if len(target_word) < 2 or any(zw in target_word for zw in self.zero_width_chars):
                 continue
 
             # Candidate positions to split inside the word
@@ -324,7 +328,7 @@ class HTMLTagInjectionAttack(TargetedStructureTransformation):
             raise ValueError(f"{self.name} requires a target_model_oracle.")
 
         headers, body, sep = _separate_headers_body(text)
-        words = body.split()
+        words = re.findall(r"(?:<[^>]+>|\S)+", body)
         if not words:
             return text
 
@@ -338,15 +342,19 @@ class HTMLTagInjectionAttack(TargetedStructureTransformation):
             importance_ranking = _compute_word_importance(
                 oracle, current_words, original_label, original_conf, headers, sep
             )
+            if hasattr(budget, "computed_word_ranking"):
+                budget.computed_word_ranking = list(importance_ranking)
 
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:
                 break
+            if hasattr(budget, "evaluated_word_indices"):
+                budget.evaluated_word_indices.append(word_idx)
             if importance == float("-inf"):
                 continue
 
             target_word = current_words[word_idx]
-            if len(target_word) < 2:
+            if len(target_word) < 2 or any(tag in target_word for tag in self.tags):
                 continue
 
             mid = len(target_word) // 2
@@ -443,14 +451,22 @@ class HTMLEntityEncodingAttack(TargetedStructureTransformation):
             importance_ranking = _compute_word_importance(
                 oracle, current_words, original_label, original_conf, headers, sep
             )
+            if hasattr(budget, "computed_word_ranking"):
+                budget.computed_word_ranking = list(importance_ranking)
+
+        all_entities = {ent for ents in self.entity_map.values() for ent in ents}
 
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:
                 break
+            if hasattr(budget, "evaluated_word_indices"):
+                budget.evaluated_word_indices.append(word_idx)
             if importance == float("-inf"):
                 continue
 
             target_word = current_words[word_idx]
+            if any(ent in target_word for ent in all_entities):
+                continue
             match_indices = [
                 (i, ch) for i, ch in enumerate(target_word)
                 if ch.lower() in self.entity_map
@@ -632,14 +648,22 @@ class HomoglyphSubstitutionAttack(TargetedStructureTransformation):
             importance_ranking = _compute_word_importance(
                 oracle, current_words, original_label, original_conf, headers, sep
             )
+            if hasattr(budget, "computed_word_ranking"):
+                budget.computed_word_ranking = list(importance_ranking)
+
+        all_homoglyphs = set(self.homoglyph_map.values())
 
         for word_idx, importance in importance_ranking:
             if budget.remaining <= 0:
                 break
+            if hasattr(budget, "evaluated_word_indices"):
+                budget.evaluated_word_indices.append(word_idx)
             if importance == float("-inf"):
                 continue
 
             target_word = current_words[word_idx]
+            if any(h in target_word for h in all_homoglyphs):
+                continue
             match_indices = [
                 (i, ch) for i, ch in enumerate(target_word)
                 if ch in self.homoglyph_map

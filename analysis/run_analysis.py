@@ -346,19 +346,56 @@ def attack_text(
     budget_frac: float,
     attacker,
     word_ranking: list[tuple[int, float]] | None = None,
+    max_edits: int | None = None,
+    sample_state: dict | None = None,
 ) -> tuple[str, int, bool]:
-    word_count = len(text.split())
-    max_edits = max(1, int(word_count * budget_frac)) if budget_frac > 0 else 0
-    budget = PerturbationBudget(max_edits=max_edits)
+    if sample_state is not None:
+        orig_ref = sample_state.get("original_text", text)
+        already_succeeded = bool(sample_state.get("has_succeeded", False) or text != orig_ref)
+        if sample_state.get("evaded", False) or sample_state.get("exhausted", False):
+            return text, 0, already_succeeded
+
+        base_wc = sample_state.get("orig_word_count") or len(text.split())
+        if max_edits is not None:
+            effective_max_edits = max(0, int(max_edits))
+        else:
+            effective_max_edits = max(1, int(base_wc * budget_frac)) if budget_frac > 0 else 0
+
+        if effective_max_edits <= 0:
+            return text, 0, already_succeeded
+
+        base_ranking = sample_state.get("cached_ranking")
+        if base_ranking is None and word_ranking is not None:
+            base_ranking = list(word_ranking)
+            sample_state["cached_ranking"] = base_ranking
+
+        if base_ranking is not None:
+            visited = sample_state.setdefault("visited_word_indices", set())
+            effective_ranking = [
+                item for item in base_ranking
+                if (item[0] if isinstance(item, (tuple, list)) else item) not in visited
+            ]
+        else:
+            effective_ranking = None
+    else:
+        word_count = len(text.split())
+        if max_edits is not None:
+            effective_max_edits = max(0, int(max_edits))
+        else:
+            effective_max_edits = max(1, int(word_count * budget_frac)) if budget_frac > 0 else 0
+        effective_ranking = word_ranking
+
+    budget = PerturbationBudget(max_edits=effective_max_edits)
 
     success = True
+    had_exception = False
     try:
-        if word_ranking is not None:
+        if effective_ranking is not None:
             sig = inspect.signature(attacker.transform)
             if "word_ranking" in sig.parameters or any(
                 p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
             ):
-                perturbed = attacker.transform(text, budget, word_ranking=word_ranking)
+                perturbed = attacker.transform(text, budget, word_ranking=effective_ranking)
             else:
                 perturbed = attacker.transform(text, budget)
         else:
@@ -369,6 +406,24 @@ def attack_text(
         traceback.print_exc()
         perturbed = text
         success = False
+        had_exception = True
+
+    if sample_state is not None and not had_exception:
+        if sample_state.get("cached_ranking") is None and getattr(budget, "computed_word_ranking", None) is not None:
+            sample_state["cached_ranking"] = list(budget.computed_word_ranking)
+        if getattr(budget, "evaluated_word_indices", None):
+            visited = sample_state.setdefault("visited_word_indices", set())
+            visited.update(budget.evaluated_word_indices)
+            if sample_state.get("cached_ranking") is not None:
+                remaining_actionable = [
+                    item for item in sample_state["cached_ranking"]
+                    if (item[0] if isinstance(item, (tuple, list)) else item) not in visited
+                    and (not isinstance(item, (tuple, list)) or len(item) < 2 or float(item[1]) > float("-inf"))
+                ]
+                if not remaining_actionable:
+                    sample_state["exhausted"] = True
+        if budget.consumed == 0 and perturbed == text and effective_max_edits > 0:
+            sample_state["exhausted"] = True
 
     # Calculate real budget consumed (word differences or budget.consumed)
     orig_words = text.split()
@@ -381,24 +436,48 @@ def attack_text(
         consumed = budget.consumed
 
     # If budget was requested but no edits were made, mark as failed
-    if budget_frac > 0 and consumed == 0 and perturbed == text:
-        success = False
+    if sample_state is not None:
+        orig_ref = sample_state.get("original_text", text)
+        already_succeeded = bool(sample_state.get("has_succeeded", False) or perturbed != orig_ref)
+        if budget_frac > 0 and consumed == 0 and perturbed == text and not already_succeeded:
+            success = False
+    else:
+        if budget_frac > 0 and consumed == 0 and perturbed == text:
+            success = False
 
     return perturbed, consumed, success
 
 
-def _invoke_attack_text(text: str, budget_frac: float, attacker, sample_ranking=None):
+def _invoke_attack_text(
+    text: str,
+    budget_frac: float,
+    attacker,
+    sample_ranking=None,
+    max_edits: int | None = None,
+    sample_state: dict | None = None,
+):
     """
-    Helper to call `attack_text`, forwarding `word_ranking` only when non-None
-    and accepted by `attack_text` (preserving compatibility with 3-arg test mocks).
+    Helper to call `attack_text`, forwarding optional keyword arguments only when
+    non-None and accepted by `attack_text` (or its mock `side_effect`, preserving
+    compatibility with 3-arg and 4-arg test mocks).
     """
-    if sample_ranking is not None:
-        sig = inspect.signature(attack_text)
-        if "word_ranking" in sig.parameters or any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        ):
-            return attack_text(text, budget_frac, attacker, word_ranking=sample_ranking)
-    return attack_text(text, budget_frac, attacker)
+    target_fn = (
+        attack_text.side_effect
+        if callable(getattr(attack_text, "side_effect", None))
+        else attack_text
+    )
+    sig = inspect.signature(target_fn)
+    has_var_kw = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
+    kwargs = {}
+    if sample_ranking is not None and ("word_ranking" in sig.parameters or has_var_kw):
+        kwargs["word_ranking"] = sample_ranking
+    if max_edits is not None and ("max_edits" in sig.parameters or has_var_kw):
+        kwargs["max_edits"] = max_edits
+    if sample_state is not None and ("sample_state" in sig.parameters or has_var_kw):
+        kwargs["sample_state"] = sample_state
+    return attack_text(text, budget_frac, attacker, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -421,7 +500,10 @@ def run_single_analysis(
     work_pool: WorkPool | None = None,
     word_ranking: bool = False,
     word_rankings: dict[int, list[tuple[int, float]]] | list[list[tuple[int, float]]] | None = None,
+    greedy: bool = True,
+    non_greedy: bool = False,
 ):
+    use_greedy = False if non_greedy else bool(greedy)
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
@@ -537,6 +619,7 @@ def run_single_analysis(
     total_steps = len(budgets)
     print(f"\nTarget Detector : {det_spec['display_name']} ({resolved_model_path.name})")
     print(f"Attacker        : {att_spec['display_name']}")
+    print(f"Budget Strategy : {'Greedy (Incremental Base)' if use_greedy else 'Non-Greedy (Legacy From-Scratch)'}")
     print(f"Parallel Pool   : {'Enabled (' + str(effective_workers) + ' workers)' if parallel else 'Disabled (Sequential)'}")
     print(f"Word Ranking    : {'Precomputed / Shared' if use_word_ranking else 'Per-attack Default'}")
     print(f"Saving results to: {results_dir}")
@@ -545,9 +628,32 @@ def run_single_analysis(
     # Track samples that have already flipped detection (pred != 1)
     flipped_samples = {}  # sample_idx -> dict of cached results
 
+    # Track per-sample state across budget iterations for greedy continuation
+    sample_states = {
+        i: {
+            "original_text": original_texts[i],
+            "orig_word_count": len(original_texts[i].split()),
+            "current_text": original_texts[i],
+            "allocated_max_edits": 0,
+            "cumulative_consumed": 0,
+            "has_succeeded": False,
+            "evaded": False,
+            "exhausted": False,
+            "cached_ranking": (
+                list(sample_word_rankings[i])
+                if (sample_word_rankings is not None and i in sample_word_rankings)
+                else None
+            ),
+            "visited_word_indices": set(),
+        }
+        for i in range(num_valid)
+    }
+
     try:
         for step_idx, budget_frac in enumerate(budgets):
             pct = int(budget_frac * 100)
+            prev_budget_frac = budgets[step_idx - 1] if step_idx > 0 else 0.0
+            step_budget_frac = round(budget_frac - prev_budget_frac, 6) if use_greedy else budget_frac
 
             # Determine which samples need attacking in this budget step
             if skip_flipped:
@@ -567,23 +673,37 @@ def run_single_analysis(
             active_consumed = {}
             active_success = {}
 
-            if active_pool is not None and active_indices:
-                def _run_sample_attack(sample_idx: int):
+            def _prepare_and_attack(sample_idx: int):
+                s_rank = sample_word_rankings.get(sample_idx) if sample_word_rankings is not None else None
+                if use_greedy:
+                    state = sample_states[sample_idx]
+                    base_text = state["current_text"]
+                    orig_wc = state["orig_word_count"]
+                    target_max_edits = max(1, int(orig_wc * budget_frac)) if budget_frac > 0 else 0
+                    step_max_edits = max(0, target_max_edits - state["allocated_max_edits"])
+                    state["allocated_max_edits"] = max(state["allocated_max_edits"], target_max_edits)
+                    pert, cons, succ = _invoke_attack_text(
+                        base_text,
+                        step_budget_frac,
+                        attacker,
+                        s_rank,
+                        max_edits=step_max_edits,
+                        sample_state=state,
+                    )
+                else:
                     text = original_texts[sample_idx]
-                    s_rank = sample_word_rankings.get(sample_idx) if sample_word_rankings is not None else None
                     pert, cons, succ = _invoke_attack_text(text, budget_frac, attacker, s_rank)
-                    return sample_idx, pert, cons, succ
+                return sample_idx, pert, cons, succ
 
-                pool_results = active_pool.map(_run_sample_attack, active_indices)
+            if active_pool is not None and active_indices:
+                pool_results = active_pool.map(_prepare_and_attack, active_indices)
                 for i, pert, cons, succ in pool_results:
                     active_perturbed[i] = pert
                     active_consumed[i] = cons
                     active_success[i] = succ
             else:
                 for i in active_indices:
-                    text = original_texts[i]
-                    s_rank = sample_word_rankings.get(i) if sample_word_rankings is not None else None
-                    pert, cons, succ = _invoke_attack_text(text, budget_frac, attacker, s_rank)
+                    _, pert, cons, succ = _prepare_and_attack(i)
                     active_perturbed[i] = pert
                     active_consumed[i] = cons
                     active_success[i] = succ
@@ -621,17 +741,31 @@ def run_single_analysis(
                     p_conf = float(active_confidences[active_pos])
                     active_pos += 1
 
+                    if use_greedy:
+                        state = sample_states[i]
+                        state["current_text"] = p_text
+                        state["cumulative_consumed"] += p_cons
+                        if p_succ and (p_cons > 0 or p_text != state["original_text"]):
+                            state["has_succeeded"] = True
+                        if p_pred != 1:
+                            state["evaded"] = True
+                        total_cons = state["cumulative_consumed"]
+                        total_succ = p_succ
+                    else:
+                        total_cons = p_cons
+                        total_succ = p_succ
+
                     step_perturbed_texts.append(p_text)
-                    step_consumed_budgets.append(p_cons)
-                    step_success_flags.append(p_succ)
+                    step_consumed_budgets.append(total_cons)
+                    step_success_flags.append(total_succ)
                     step_pert_preds.append(p_pred)
                     step_pert_confidences.append(p_conf)
 
                     if skip_flipped and p_pred != 1:
                         flipped_samples[i] = {
                             "perturbed_text": p_text,
-                            "consumed_budget": p_cons,
-                            "success": p_succ,
+                            "consumed_budget": total_cons,
+                            "success": total_succ,
                             "perturbed_pred": p_pred,
                             "perturbed_confidence": p_conf,
                         }
@@ -717,6 +851,8 @@ def run_single_analysis(
         "seed": seed,
         "max_budget": max_budget,
         "budget_steps": budget_steps,
+        "greedy": use_greedy,
+        "non_greedy": not use_greedy,
         "skip_flipped": skip_flipped,
         "parallel": parallel,
         "num_workers": effective_workers,
@@ -884,7 +1020,22 @@ def parse_args():
         default=False,
         help="Precompute word importance rankings once per sample and reuse them across budget steps and attack algorithms."
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--greedy",
+        dest="greedy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use the previous budget step's perturbed output as the base for the next budget step (default: True)."
+    )
+    parser.add_argument(
+        "--non-greedy",
+        dest="greedy",
+        action="store_false",
+        help="Legacy mode: recompute each budget step from scratch instead of using the previous iteration as base."
+    )
+    args = parser.parse_args()
+    args.non_greedy = not args.greedy
+    return args
 
 
 def main():
@@ -906,7 +1057,7 @@ def main():
     print(f"Attackers: {', '.join(attackers_to_run)}")
     print(
         f"Samples: {args.samples} | Budget Steps: {args.budget_steps} | "
-        f"Max Budget: {args.max_budget:.2%} | Skip Flipped: {args.skip_flipped} | "
+        f"Max Budget: {args.max_budget:.2%} | Greedy: {args.greedy} | Skip Flipped: {args.skip_flipped} | "
         f"Parallel: {args.parallel} | Word Ranking: {args.word_ranking}"
     )
 
@@ -947,6 +1098,8 @@ def main():
                     work_pool=shared_pool,
                     word_ranking=args.word_ranking,
                     word_rankings=shared_word_rankings,
+                    greedy=args.greedy,
+                    non_greedy=args.non_greedy,
                 )
     finally:
         if shared_pool is not None:

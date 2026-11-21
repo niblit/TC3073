@@ -58,7 +58,9 @@ python run_analysis.py \
 
 *Note: Adding `--report` (or `--visualize`) automatically generates an interactive HTML dashboard in the results directory.*
 
-#### Performance Acceleration (`--skip-flipped`, `--parallel`, `--word-ranking`):
+#### Performance Acceleration (`--greedy` / `--non-greedy`, `--skip-flipped`, `--parallel`, `--word-ranking`):
+- `--greedy` (default) and `--non-greedy` (alias: `--no-greedy`):
+  By default, degradation curve evaluation runs in **greedy incremental mode**: each budget step uses the perturbed text and state from the previous budget step as its starting base and only applies the incremental budget difference (e.g., iterating from 1% to 2% only computes the extra 1% on top of the 1% output, reusing word importance rankings and skipping already-evaluated tokens). Pass `--non-greedy` (or `--no-greedy`) to revert to the legacy behavior that recomputes each budget step from scratch starting from the unperturbed original text.
 - `--skip-flipped` (aliases: `--skip-if-flipped`, `--early-stop`, `--no-skip-flipped`):
   When enabled, any sample that already flipped detection (`perturbed_pred != 1`) in an earlier budget step is skipped in all subsequent budget steps. Because adversarial algorithms stop running once they flip the detector, re-attacking already-evaded samples at larger budgets is redundant; skipping them reuses their flipped state and drastically accelerates degradation curve generation.
 - `--parallel` (aliases: `--work-pool`, `--use-work-pool`, `--no-parallel`) and `--workers N` (`-w N`):

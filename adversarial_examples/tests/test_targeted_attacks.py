@@ -415,3 +415,54 @@ class TestWordRankingSupport:
 
         # Zero additional deletion queries should have occurred across all 4 attacks!
         assert len(deletion_calls) == initial_deletion_count
+
+    @pytest.mark.parametrize("attack_cls", [
+        ZeroWidthInjectionAttack,
+        HTMLTagInjectionAttack,
+        HTMLEntityEncodingAttack,
+        HomoglyphSubstitutionAttack,
+    ])
+    def test_incremental_greedy_continuation_across_budget_steps(self, attack_cls):
+        """
+        Verify that applying 1 edit at Step 1 and then continuing from Step 1's perturbed
+        text with 1 additional edit at Step 2 produces the exact same 2-edit perturbed text
+        as running 2 edits from scratch, while recording evaluated_word_indices and
+        computed_word_ranking on PerturbationBudget.
+        """
+        text = "Please verify account password immediately"
+
+        def oracle(t):
+            # Lower confidence slightly for any perturbation, without flipping label
+            score = 0.95
+            for kw in ("verify", "account", "password", "immediately"):
+                if kw not in t.split():
+                    score -= 0.10
+            return ("phishing", round(max(0.55, score), 4))
+
+        attack = attack_cls(target_model_oracle=oracle)
+
+        # From-scratch 2-edit run
+        scratch_budget = PerturbationBudget(max_edits=2)
+        scratch_result = attack.transform(text, scratch_budget)
+        assert scratch_budget.consumed == 2
+        assert scratch_budget.computed_word_ranking is not None
+        assert len(scratch_budget.evaluated_word_indices) >= 2
+
+        # Greedy Step 1 (1 edit)
+        step1_budget = PerturbationBudget(max_edits=1)
+        step1_text = attack.transform(text, step1_budget)
+        assert step1_budget.consumed == 1
+        assert step1_budget.computed_word_ranking is not None
+
+        # Greedy Step 2 (1 incremental edit starting from step1_text, filtering visited words)
+        visited = set(step1_budget.evaluated_word_indices)
+        remaining_ranking = [
+            item for item in step1_budget.computed_word_ranking
+            if item[0] not in visited
+        ]
+        step2_budget = PerturbationBudget(max_edits=1)
+        step2_text = attack.transform(step1_text, step2_budget, word_ranking=remaining_ranking)
+        assert step2_budget.consumed == 1
+
+        # Greedy incremental output after Step 2 must match the 2-edit from-scratch output
+        assert step2_text == scratch_result

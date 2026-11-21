@@ -808,3 +808,58 @@ class TestOracleCallCounts:
         assert result == "quick tan fox"
         assert budget.consumed == 1
         assert len(call_log) == 2
+
+    def test_incremental_greedy_continuation_matches_from_scratch(self):
+        """
+        Verify that running TextFoolerAttack incrementally across two budget steps
+        (using step 1's output and remaining ranking as base for step 2) produces
+        the exact same 2-edit output as running 2 edits from scratch, while computing
+        word importance only once.
+        """
+        pos_map = {
+            "quick": "ADJ", "fast": "ADJ",
+            "brown": "ADJ", "tan": "ADJ",
+            "fox": "NOUN", "wolf": "NOUN",
+        }
+        spacy = make_spacy_model(pos_map)
+        cf = make_counter_fitted_vectors({
+            "quick": [("fast", 0.85)],
+            "brown": [("tan", 0.78)],
+            "fox": [("wolf", 0.75)],
+        })
+        use = make_use_model()
+
+        def oracle(text):
+            score = 0.95
+            for orig_w in ("quick", "brown", "fox"):
+                if orig_w not in text.split():
+                    score -= 0.10
+            return ("phishing", round(score, 4))
+
+        attack = TextFoolerAttack(
+            target_model_oracle=oracle,
+            counter_fitted_vectors=cf,
+            use_model=use,
+            spacy_model=spacy,
+        )
+
+        # From scratch with max_edits=2
+        scratch_budget = PerturbationBudget(max_edits=2)
+        scratch_res = attack.transform("quick brown fox", scratch_budget)
+        assert scratch_budget.consumed == 2
+        assert scratch_budget.computed_word_ranking is not None
+
+        # Greedy Step 1 (max_edits=1)
+        b1 = PerturbationBudget(max_edits=1)
+        step1_res = attack.transform("quick brown fox", b1)
+        assert b1.consumed == 1
+        assert b1.computed_word_ranking is not None
+        assert len(b1.evaluated_word_indices) == 1
+
+        # Greedy Step 2 (max_edits=1, starting from step1_res with remaining ranking)
+        visited = set(b1.evaluated_word_indices)
+        rem_ranking = [item for item in b1.computed_word_ranking if item[0] not in visited]
+        b2 = PerturbationBudget(max_edits=1)
+        step2_res = attack.transform(step1_res, b2, word_ranking=rem_ranking)
+        assert b2.consumed == 1
+        assert step2_res == scratch_res

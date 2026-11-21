@@ -733,3 +733,339 @@ def test_sample_selection_rejects_unclassified_without_refilling_and_preserves_s
     assert rows_a[2] == rows_b[2]
 
 
+def test_parse_args_greedy_and_non_greedy_flags():
+    """Verify CLI argument parsing for default greedy mode and --non-greedy legacy flag."""
+    with patch("sys.argv", ["run_analysis.py"]):
+        args = parse_args()
+        assert args.greedy is True
+        assert args.non_greedy is False
+
+    with patch("sys.argv", ["run_analysis.py", "--non-greedy"]):
+        args = parse_args()
+        assert args.greedy is False
+        assert args.non_greedy is True
+
+    with patch("sys.argv", ["run_analysis.py", "--no-greedy"]):
+        args = parse_args()
+        assert args.greedy is False
+        assert args.non_greedy is True
+
+    with patch("sys.argv", ["run_analysis.py", "--greedy"]):
+        args = parse_args()
+        assert args.greedy is True
+        assert args.non_greedy is False
+
+    with patch("sys.argv", ["run_analysis.py", "--non-greedy", "--greedy"]):
+        args = parse_args()
+        assert args.greedy is True
+        assert args.non_greedy is False
+
+    with patch("sys.argv", ["run_analysis.py", "--greedy", "--non-greedy"]):
+        args = parse_args()
+        assert args.greedy is False
+        assert args.non_greedy is True
+
+
+def test_greedy_mode_uses_previous_iteration_as_base_and_accumulates_budget(tmp_path):
+    """
+    Verify that in default greedy mode:
+    1. Iteration k uses iteration (k-1)'s perturbed text as its input base.
+    2. Iteration k only receives the incremental budget delta (e.g. 0.01 at 1%, 0.01 at 2%, 0.01 at 3%).
+    3. raw_results.csv preserves original_text_b64 as the unperturbed text while recording cumulative
+       real_budget_consumed and progressive perturbed_text_b64 at each budget step.
+    """
+    import base64
+
+    orig_text = " ".join([f"word{i}" for i in range(100)])
+    data_file = tmp_path / "texts.json"
+    data_file.write_text(json.dumps([{"text": orig_text, "label": 1}]))
+
+    output_dir = tmp_path / "run_greedy_default"
+    attack_calls = []
+
+    def mock_attack_text(text, budget_frac, attacker):
+        step_num = len(attack_calls) + 1
+        attack_calls.append((text, budget_frac))
+        return f"{text} [edit_{step_num}]", 1, True
+
+    mock_detector = MagicMock()
+    mock_detector.predict.side_effect = lambda texts: [1] * len(texts)
+    mock_detector.predict_proba.side_effect = lambda texts: [[0.2, 0.8]] * len(texts)
+
+    with patch("run_analysis.load_detector") as mock_load_det, \
+         patch("run_analysis.attack_text", side_effect=mock_attack_text):
+
+        mock_load_det.return_value = (
+            mock_detector,
+            "mock_det",
+            {"display_name": "Mock Detector"},
+            Path("/mock/model"),
+        )
+
+        res_dir = run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="zero_width",
+            num_samples=1,
+            max_budget=0.03,
+            budget_steps=3,
+            seed=42,
+            data_path=data_file,
+            output_dir=output_dir,
+        )
+
+    assert res_dir is not None
+    assert len(attack_calls) == 3
+
+    # Step 1 (1%): base is orig_text, step budget is 0.01
+    assert attack_calls[0] == (orig_text, 0.01)
+    # Step 2 (2%): base is Step 1's output, step budget is incremental 0.01 (NOT 0.02 from scratch)
+    assert attack_calls[1] == (f"{orig_text} [edit_1]", 0.01)
+    # Step 3 (3%): base is Step 2's output, step budget is incremental 0.01 (NOT 0.03 from scratch)
+    assert attack_calls[2] == (f"{orig_text} [edit_1] [edit_2]", 0.01)
+
+    with open(output_dir / "raw_results.csv", "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    assert len(rows) == 3
+
+    # Verify cumulative budget consumption and base64 texts
+    for idx, row in enumerate(rows, start=1):
+        decoded_orig = base64.b64decode(row["original_text_b64"]).decode("utf-8")
+        decoded_pert = base64.b64decode(row["perturbed_text_b64"]).decode("utf-8")
+        assert decoded_orig == orig_text
+        expected_edits = " ".join([f"[edit_{k}]" for k in range(1, idx + 1)])
+        assert decoded_pert == f"{orig_text} {expected_edits}"
+        assert int(row["real_budget_consumed"]) == idx
+
+    cfg = json.loads((output_dir / "run_config.json").read_text(encoding="utf-8"))
+    assert cfg["greedy"] is True
+    assert cfg["non_greedy"] is False
+
+
+def test_non_greedy_flag_reverts_to_legacy_from_scratch_behavior(tmp_path):
+    """
+    Verify that passing non_greedy=True (or greedy=False) reverts to the legacy
+    from-scratch behavior where every budget step starts from original_text
+    with the full cumulative budget fraction.
+    """
+    orig_text = " ".join([f"word{i}" for i in range(100)])
+    data_file = tmp_path / "texts.json"
+    data_file.write_text(json.dumps([{"text": orig_text, "label": 1}]))
+
+    output_dir = tmp_path / "run_non_greedy"
+    attack_calls = []
+
+    def mock_attack_text(text, budget_frac, attacker):
+        step_num = len(attack_calls) + 1
+        attack_calls.append((text, budget_frac))
+        return f"{text} [scratch_{step_num}]", step_num, True
+
+    mock_detector = MagicMock()
+    mock_detector.predict.side_effect = lambda texts: [1] * len(texts)
+    mock_detector.predict_proba.side_effect = lambda texts: [[0.2, 0.8]] * len(texts)
+
+    with patch("run_analysis.load_detector") as mock_load_det, \
+         patch("run_analysis.attack_text", side_effect=mock_attack_text):
+
+        mock_load_det.return_value = (
+            mock_detector,
+            "mock_det",
+            {"display_name": "Mock Detector"},
+            Path("/mock/model"),
+        )
+
+        res_dir = run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="zero_width",
+            num_samples=1,
+            max_budget=0.03,
+            budget_steps=3,
+            seed=42,
+            data_path=data_file,
+            output_dir=output_dir,
+            non_greedy=True,
+        )
+
+    assert res_dir is not None
+    assert len(attack_calls) == 3
+
+    # Every step starts from orig_text with full cumulative budget (0.01, 0.02, 0.03)
+    assert attack_calls[0] == (orig_text, 0.01)
+    assert attack_calls[1] == (orig_text, 0.02)
+    assert attack_calls[2] == (orig_text, 0.03)
+
+    cfg = json.loads((output_dir / "run_config.json").read_text(encoding="utf-8"))
+    assert cfg["greedy"] is False
+    assert cfg["non_greedy"] is True
+
+
+def test_greedy_vs_non_greedy_real_attacker_equivalence_and_oracle_query_reduction(tmp_path):
+    """
+    End-to-end integration test running the REAL attack_text and REAL ZeroWidthInjectionAttack
+    across 4 budget steps (5%, 10%, 15%, 20% on a 20-word email -> 1, 2, 3, 4 edits).
+    Verifies that:
+    1. Greedy mode produces the EXACT same perturbed texts, predictions, confidences,
+       and consumed budgets at every budget step as Non-Greedy mode.
+    2. Greedy mode drastically reduces the number of oracle queries by reusing the
+       previous step's output and word ranking and only evaluating new candidate words.
+    """
+    import base64
+
+    # 20 non-stopword-rich tokens so 5%, 10%, 15%, 20% map to 1, 2, 3, 4 edits
+    sample_text = (
+        "Urgent security alert please verify corporate account password "
+        "credentials immediately avoid suspension banking access portal "
+        "login confirmation required today now"
+    )
+    assert len(sample_text.split()) == 20
+
+    data_file = tmp_path / "texts.json"
+    data_file.write_text(json.dumps([{"text": sample_text, "label": 1}]))
+
+    sensitive_roots = ["password", "credentials", "verify", "account", "urgent", "security"]
+
+    def make_counting_detector():
+        det = MagicMock()
+        query_count = [0]
+
+        def score_text(t: str) -> float:
+            # Each unsplit sensitive word contributes to phishing confidence
+            words_lower = [w.lower() for w in t.split()]
+            hits = sum(1 for root in sensitive_roots if root in words_lower)
+            # Base 0.55 + 0.07 per unperturbed sensitive keyword
+            return round(min(0.97, 0.55 + 0.07 * hits), 4)
+
+        def predict(texts):
+            query_count[0] += len(texts)
+            return [1 if score_text(t) >= 0.50 else 0 for t in texts]
+
+        def predict_proba(texts):
+            res = []
+            for t in texts:
+                p1 = score_text(t)
+                res.append([round(1.0 - p1, 4), p1])
+            return res
+
+        det.predict.side_effect = predict
+        det.predict_proba.side_effect = predict_proba
+        return det, query_count
+
+    det_greedy, count_greedy = make_counting_detector()
+    det_non_greedy, count_non_greedy = make_counting_detector()
+
+    out_greedy = tmp_path / "real_greedy"
+    out_non_greedy = tmp_path / "real_non_greedy"
+
+    with patch("run_analysis.load_detector", return_value=(det_greedy, "lr", {"display_name": "LR"}, Path("/mock/lr"))):
+        run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="zero_width",
+            num_samples=1,
+            max_budget=0.20,
+            budget_steps=4,
+            seed=42,
+            data_path=data_file,
+            output_dir=out_greedy,
+            greedy=True,
+        )
+
+    with patch("run_analysis.load_detector", return_value=(det_non_greedy, "lr", {"display_name": "LR"}, Path("/mock/lr"))):
+        run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="zero_width",
+            num_samples=1,
+            max_budget=0.20,
+            budget_steps=4,
+            seed=42,
+            data_path=data_file,
+            output_dir=out_non_greedy,
+            non_greedy=True,
+        )
+
+    with open(out_greedy / "raw_results.csv", "r", encoding="utf-8") as f:
+        rows_greedy = list(csv.DictReader(f))
+    with open(out_non_greedy / "raw_results.csv", "r", encoding="utf-8") as f:
+        rows_non_greedy = list(csv.DictReader(f))
+
+    assert len(rows_greedy) == 4
+    assert len(rows_non_greedy) == 4
+
+    for rg, rng in zip(rows_greedy, rows_non_greedy):
+        assert rg["budget"] == rng["budget"]
+        pert_g = base64.b64decode(rg["perturbed_text_b64"]).decode("utf-8")
+        pert_ng = base64.b64decode(rng["perturbed_text_b64"]).decode("utf-8")
+        assert pert_g == pert_ng
+        assert rg["perturbed_confidence"] == rng["perturbed_confidence"]
+        assert rg["real_budget_consumed"] == rng["real_budget_consumed"]
+        assert rg["transformation_success"] == rng["transformation_success"] == "True"
+
+    # Greedy mode must make less than half as many detector/oracle queries as Non-Greedy mode
+    assert count_greedy[0] < count_non_greedy[0] * 0.5
+
+
+def test_greedy_mode_stops_querying_oracle_after_evasion_or_exhaustion(tmp_path):
+    """
+    Verify that in greedy mode (even with skip_flipped=False), once a sample flips
+    detection at Step 1 (or exhausts all candidate edits), Steps 2 and 3 reuse the
+    perturbed result without making redundant oracle calls or flipping a benign text
+    back to phishing, while preserving transformation_success=True and consumed budget.
+    """
+    sample_text = (
+        "Urgent security alert please verify corporate account password "
+        "credentials immediately avoid suspension banking access portal "
+        "login confirmation required today now"
+    )
+    data_file = tmp_path / "texts.json"
+    data_file.write_text(json.dumps([{"text": sample_text, "label": 1}]))
+
+    det = MagicMock()
+    oracle_queries = []
+
+    def score_text(t: str) -> float:
+        # As soon as "support@microsoft.com" is injected by SenderHeaderAttack, flip to benign (0.15)
+        if "support@microsoft.com" in t:
+            return 0.15
+        return 0.92
+
+    def predict(texts):
+        for t in texts:
+            oracle_queries.append(t)
+        return [1 if score_text(t) >= 0.50 else 0 for t in texts]
+
+    def predict_proba(texts):
+        return [[round(1.0 - score_text(t), 4), score_text(t)] for t in texts]
+
+    det.predict.side_effect = predict
+    det.predict_proba.side_effect = predict_proba
+
+    out_dir = tmp_path / "greedy_early_evade"
+    with patch("run_analysis.load_detector", return_value=(det, "lr", {"display_name": "LR"}, Path("/mock/lr"))):
+        run_single_analysis(
+            detector_type="logistic_regression",
+            attacker_type="sender_header",
+            num_samples=1,
+            max_budget=0.15,
+            budget_steps=3,
+            seed=42,
+            data_path=data_file,
+            output_dir=out_dir,
+            skip_flipped=False,
+            greedy=True,
+        )
+
+    with open(out_dir / "raw_results.csv", "r", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+
+    assert len(rows) == 3
+    for r in rows:
+        assert r["evaded"] == "1"
+        assert r["perturbed_pred"] == "0"
+        assert r["transformation_success"] == "True"
+        assert int(r["real_budget_consumed"]) > 0
+
+    # Oracle queries:
+    # 1 initial predict + (1 original check + 1 first candidate flip) in Step 1 + 3 step batch predicts = 6 total!
+    # Steps 2 and 3 made 0 attacker oracle queries because Step 1 already evaded.
+    assert len(oracle_queries) == 6
+
+
+

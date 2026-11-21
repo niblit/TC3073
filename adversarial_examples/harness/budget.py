@@ -9,6 +9,8 @@ class PerturbationBudget:
     def __init__(self, max_edits: int):
         self._max_edits = max_edits
         self._consumed = 0
+        self.evaluated_word_indices: list[int] = []
+        self.computed_word_ranking: list[tuple[int, float]] | None = None
 
     @property
     def remaining(self) -> int:
