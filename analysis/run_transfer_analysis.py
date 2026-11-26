@@ -162,6 +162,10 @@ ATTACK_METADATA = {
         "display_name": "Combined All Attacks (Best-of-K)",
         "category": "combined",
     },
+    "neutral_padding": {
+        "display_name": "Neutral Padding Control",
+        "category": "control",
+    },
 }
 
 DEFAULT_SINGLE_RUNS_DIR = (
@@ -356,6 +360,20 @@ def batched_predict_malicious_proba_and_label(
     return out_preds, out_probs, cache_hits, num_inferred
 
 
+def _unwrap_timestamp_dir(base_dir: Path) -> Path:
+    """If `base_dir` has no direct `*_raw_results` subdirs but contains timestamp subdirs, pick latest."""
+    if not base_dir.exists():
+        return base_dir
+    direct = [d for d in base_dir.iterdir() if d.is_dir() and (d / "raw_results.csv").exists()]
+    if direct:
+        return base_dir
+    ts_dirs = sorted(
+        [d for d in base_dir.iterdir() if d.is_dir() and any((sd / "raw_results.csv").exists() for sd in d.iterdir() if sd.is_dir())],
+        key=lambda d: d.name,
+    )
+    return ts_dirs[-1] if ts_dirs else base_dir
+
+
 # ---------------------------------------------------------------------------
 # Main Transferability Pipeline
 # ---------------------------------------------------------------------------
@@ -367,7 +385,15 @@ def run_transferability_analysis(
     batch_size: int = 128,
 ) -> dict:
     overall_start = time.time()
+    single_runs_dir = _unwrap_timestamp_dir(single_runs_dir)
+    combined_runs_dir = _unwrap_timestamp_dir(combined_runs_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    has_neutral_control = all(
+        (single_runs_dir / f"{det}_neutral_padding" / "raw_results.csv").exists()
+        for det in DETECTOR_ORDER
+    )
+    eval_attack_keys = ALL_ATTACK_KEYS + (["neutral_padding"] if has_neutral_control else [])
 
     print("=" * 100)
     print("CROSS-DETECTOR ADVERSARIAL TRANSFERABILITY ANALYSIS (N = 1,000, Budget = 20%)")
@@ -391,11 +417,11 @@ def run_transferability_analysis(
     clean_confidences: dict[str, dict[int, float]] = {det: {} for det in DETECTOR_ORDER}
     clean_texts: dict[int, str] = {}
 
-    total_runs = len(DETECTOR_ORDER) * len(ALL_ATTACK_KEYS)
+    total_runs = len(DETECTOR_ORDER) * len(eval_attack_keys)
     loaded_count = 0
 
     for source_det in DETECTOR_ORDER:
-        for att_key in ALL_ATTACK_KEYS:
+        for att_key in eval_attack_keys:
             loaded_count += 1
             if att_key == "combine_all":
                 csv_path = combined_runs_dir / f"{source_det}_{att_key}" / "raw_results.csv"
@@ -471,8 +497,8 @@ def run_transferability_analysis(
 
     # Group off-diagonal evaluations by target detector or iterate in canonical order
     # Pre-evaluating unique perturbed texts per target detector in large batches or run-by-run with ETA
-    total_off_diag_pairs = len(ALL_ATTACK_KEYS) * len(DETECTOR_ORDER) * (len(DETECTOR_ORDER) - 1)  # 84
-    total_cells = len(ALL_ATTACK_KEYS) * len(DETECTOR_ORDER) * len(DETECTOR_ORDER)  # 126
+    total_off_diag_pairs = len(eval_attack_keys) * len(DETECTOR_ORDER) * (len(DETECTOR_ORDER) - 1)
+    total_cells = len(eval_attack_keys) * len(DETECTOR_ORDER) * len(DETECTOR_ORDER)
 
     # Estimate work weight per target detector for accurate ETA (Transformer on GPU is ~35x slower than CharCNN and ~350x slower than LR)
     target_weights = {
@@ -482,7 +508,7 @@ def run_transferability_analysis(
     }
     total_weight = sum(
         target_weights[t_det]
-        for _att in ALL_ATTACK_KEYS
+        for _att in eval_attack_keys
         for s_det in DETECTOR_ORDER
         for t_det in DETECTOR_ORDER
         if s_det != t_det
@@ -497,7 +523,7 @@ def run_transferability_analysis(
     # Store results: cell_results[(att_key, source_det, target_det)] = dict
     cell_results: dict[tuple[str, str, str], dict] = {}
 
-    for att_idx, att_key in enumerate(ALL_ATTACK_KEYS, start=1):
+    for att_idx, att_key in enumerate(eval_attack_keys, start=1):
         att_info = ATTACK_METADATA[att_key]
         for source_det in DETECTOR_ORDER:
             source_records = run_data[(source_det, att_key)]
@@ -647,7 +673,7 @@ def run_transferability_analysis(
                     total_elapsed = time.time() - t_eval_start
                     rem_sec = 0.0
                     for td in DETECTOR_ORDER:
-                        total_td_runs = len(ALL_ATTACK_KEYS) * (len(DETECTOR_ORDER) - 1)  # 28
+                        total_td_runs = len(eval_attack_keys) * (len(DETECTOR_ORDER) - 1)
                         rem_td_runs = total_td_runs - runs_done_by_target[td]
                         if runs_done_by_target[td] > 0:
                             avg_td_sec = actual_time_by_target[td] / runs_done_by_target[td]
@@ -777,10 +803,11 @@ def run_transferability_analysis(
     )
     ranked_attack_keys = [a["attack_key"] for a in attack_rankings]
 
+    csv_export_keys = ranked_attack_keys + (["neutral_padding"] if has_neutral_control else [])
     with open(matrix_csv_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=csv_fieldnames)
         writer.writeheader()
-        for att_key in ranked_attack_keys:
+        for att_key in csv_export_keys:
             for s_det in DETECTOR_ORDER:
                 for t_det in DETECTOR_ORDER:
                     writer.writerow(cell_results[(att_key, s_det, t_det)])
@@ -904,7 +931,7 @@ def run_transferability_analysis(
                 for s in DETECTOR_ORDER
                 for t in DETECTOR_ORDER
             }
-            for att_key in ranked_attack_keys
+            for att_key in csv_export_keys
         },
     }
 
@@ -1282,16 +1309,22 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
+        "--runs-dir",
+        type=str,
+        default=None,
+        help="Unified benchmark directory containing both single-attack and combine_all sub-runs (overrides --single-runs-dir and --combined-runs-dir).",
+    )
+    parser.add_argument(
         "--single-runs-dir",
         type=str,
         default=str(DEFAULT_SINGLE_RUNS_DIR),
-        help="Path to the 39 single-attack benchmark runs directory.",
+        help="Path to the single-attack benchmark runs directory.",
     )
     parser.add_argument(
         "--combined-runs-dir",
         type=str,
         default=str(DEFAULT_COMBINED_RUNS_DIR),
-        help="Path to the 3 combine_all benchmark runs directory.",
+        help="Path to the combine_all benchmark runs directory.",
     )
     parser.add_argument(
         "--output-dir",
@@ -1318,9 +1351,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+    single_dir = Path(args.runs_dir) if args.runs_dir else Path(args.single_runs_dir)
+    combined_dir = Path(args.runs_dir) if args.runs_dir else Path(args.combined_runs_dir)
     run_transferability_analysis(
-        single_runs_dir=Path(args.single_runs_dir),
-        combined_runs_dir=Path(args.combined_runs_dir),
+        single_runs_dir=single_dir,
+        combined_runs_dir=combined_dir,
         output_dir=Path(args.output_dir),
         target_budget=args.budget,
         batch_size=args.batch_size,

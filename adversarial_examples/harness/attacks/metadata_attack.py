@@ -9,9 +9,10 @@ via black-box oracles to evade phishing, BEC, and email classifiers:
 - ReceivedRoutingAttack: Injects simulated benign MTA relay hops.
 - XHeaderInjectionAttack: Injects corporate anti-spam gateway verdicts.
 - SubjectMetadataAttack: Perturbs Subject headers with benign prefixes and tags.
+- NeutralPaddingControl: Length-matched neutral filler control baseline isolating bag-of-words dilution from RFC 5322 header shortcuts.
 """
 import re
-from typing import List, Optional, Tuple, Callable
+from typing import List, Optional, Sequence, Tuple, Callable
 from harness.taxonomy import MetadataTransformation, TargetedMetadataTransformation
 from harness.budget import PerturbationBudget
 
@@ -78,15 +79,15 @@ def _inject_header(text: str, header_line: str, replace_regex: Optional[str] = N
 # ---------------------------------------------------------------------------
 
 DEFAULT_SENDER_CANDIDATES = [
-    'From: "IT Support" <support@microsoft.com>',
-    'From: "Google Workspace Admin" <admin@google.com>',
+    'From: "IT Support" <support@meridian-corp.org>',
+    'From: "Workspace Admin" <admin@vanguard-cloud.net>',
     'From: "Corporate IT Service Desk" <servicedesk@internal-support.org>',
-    'From: "Security Operations Center" <secops@github.com>',
-    'From: "Billing Operations" <billing@paypal.com>',
-    'From: "Notification Service" <notifications@amazon.com>',
-    'From: "Apple Security Team" <security@apple.com>',
-    'Reply-To: "IT Support" <support@microsoft.com>',
-    'Return-Path: <bounce@notifications.google.com>',
+    'From: "Security Operations Center" <secops@crestview-dev.org>',
+    'From: "Billing Operations" <billing@apex-payments.org>',
+    'From: "Notification Service" <notifications@horizon-retail.net>',
+    'From: "Platform Security Team" <security@orchard-systems.org>',
+    'Reply-To: "IT Support" <support@meridian-corp.org>',
+    'Return-Path: <bounce@notifications.vanguard-cloud.net>',
     'Sender: "Verified Enterprise Gateway" <gateway@corp-defense.net>',
 ]
 
@@ -157,30 +158,30 @@ class SenderHeaderAttack(TargetedMetadataTransformation):
 
 DEFAULT_AUTH_CANDIDATES = [
     (
-        "Authentication-Results: mx.google.com; "
-        "dkim=pass header.i=@google.com; "
-        "spf=pass (google.com: domain of admin@google.com designates IP) "
-        "smtp.mailfrom=admin@google.com; dmarc=pass (p=REJECT sp=REJECT)"
+        "Authentication-Results: mx.vanguard-cloud.net; "
+        "dkim=pass header.i=@vanguard-cloud.net; "
+        "spf=pass (vanguard-cloud.net: domain of admin@vanguard-cloud.net designates IP) "
+        "smtp.mailfrom=admin@vanguard-cloud.net; dmarc=pass (p=REJECT sp=REJECT)"
     ),
     (
-        "Authentication-Results: spf=pass (sender IP is 40.107.0.1) "
-        "smtp.mailfrom=microsoft.com; dkim=pass (signature was verified) "
-        "header.d=microsoft.com; dmarc=pass action=none"
+        "Authentication-Results: spf=pass (sender IP is 198.51.100.1) "
+        "smtp.mailfrom=meridian-corp.org; dkim=pass (signature was verified) "
+        "header.d=meridian-corp.org; dmarc=pass action=none"
     ),
     (
-        "Authentication-Results: protection.outlook.com; spf=pass "
+        "Authentication-Results: protection.solaris-mail.org; spf=pass "
         "smtp.mailfrom=enterprise.org; dkim=pass header.d=enterprise.org; dmarc=pass"
     ),
     (
-        "Received-SPF: pass (google.com: domain of support@google.com designates "
-        "209.85.220.65 as permitted sender) client-ip=209.85.220.65;"
+        "Received-SPF: pass (vanguard-cloud.net: domain of support@vanguard-cloud.net designates "
+        "203.0.113.65 as permitted sender) client-ip=203.0.113.65;"
     ),
     (
-        "Authentication-Results: auth.cisco.com; dkim=pass (2048-bit key) "
-        "header.i=@cisco.com; spf=pass; dmarc=pass"
+        "Authentication-Results: auth.crestview-sec.org; dkim=pass (2048-bit key) "
+        "header.i=@crestview-sec.org; spf=pass; dmarc=pass"
     ),
     (
-        "ARC-Authentication-Results: i=1; mx.google.com; dkim=pass "
+        "ARC-Authentication-Results: i=1; mx.vanguard-cloud.net; dkim=pass "
         "header.i=@trusted.org; spf=pass; dmarc=pass"
     ),
 ]
@@ -251,27 +252,27 @@ class AuthenticationResultsAttack(TargetedMetadataTransformation):
 
 DEFAULT_ROUTING_CANDIDATES = [
     (
-        "Received: from mail-sor-f65.google.com (mail-sor-f65.google.com [209.85.220.65]) "
-        "by mx.google.com with SMTPS id a10sor1234567 for <user@target.com>; "
+        "Received: from mail-relay-01.meridian-corp.org (mail-relay-01.meridian-corp.org [198.51.100.65]) "
+        "by mx.meridian-corp.org with SMTPS id a10sor1234567 for <user@example-org.net>; "
         "Mon, 12 Oct 2026 08:30:00 -0700"
     ),
     (
-        "Received: from mail-vi1eur02on0060.outbound.protection.outlook.com "
-        "(mail-vi1eur02on0060.outbound.protection.outlook.com [104.47.18.60]) "
-        "by mail.target.com with ESMTPS id MS-12345; Mon, 12 Oct 2026 15:30:00 +0000"
+        "Received: from outbound-02.protection.solaris-mail.org "
+        "(outbound-02.protection.solaris-mail.org [203.0.113.60]) "
+        "by mail.example-org.net with ESMTPS id SM-12345; Mon, 12 Oct 2026 15:30:00 +0000"
     ),
     (
-        "Received: from pps.filterd (m0123456.ppops.net [127.0.0.1]) "
-        "by mx0a-001b.pphosted.com with ESMTP id 2abcd1234 for <user@target.com>; "
+        "Received: from pps.filterd (m0123456.crestview-sec.org [127.0.0.1]) "
+        "by mx0a-001b.crestview-sec.org with ESMTP id 2abcd1234 for <user@example-org.net>; "
         "Mon, 12 Oct 2026 10:15:22 -0500"
     ),
     (
-        "Received: from o1.ptr9876.sendgrid.net (o1.ptr9876.sendgrid.net [167.89.0.1]) "
-        "by mx.target.com with ESMTPS id SG-998877; Mon, 12 Oct 2026 11:22:33 +0000"
+        "Received: from o1.ptr9876.vanguard-mail.net (o1.ptr9876.vanguard-mail.net [192.0.2.89]) "
+        "by mx.example-org.net with ESMTPS id VM-998877; Mon, 12 Oct 2026 11:22:33 +0000"
     ),
     (
-        "Received: from a27-45.smtp-out.amazonses.com (a27-45.smtp-out.amazonses.com [54.240.27.45]) "
-        "by mx.target.com with ESMTPS id SES-443322; Mon, 12 Oct 2026 09:12:00 -0400"
+        "Received: from a27-45.smtp-out.horizon-ses.org (a27-45.smtp-out.horizon-ses.org [198.51.100.45]) "
+        "by mx.example-org.net with ESMTPS id HS-443322; Mon, 12 Oct 2026 09:12:00 -0400"
     ),
 ]
 
@@ -339,13 +340,13 @@ class ReceivedRoutingAttack(TargetedMetadataTransformation):
 
 DEFAULT_XHEADER_CANDIDATES = [
     "X-Spam-Status: No, score=-4.8 required=5.0 tests=BAYES_00,DKIM_SIGNED,DKIM_VALID,HTML_MESSAGE autolearn=ham",
-    "X-Microsoft-Antispam: BCL:0;ARA:13230040|;PCL:0;",
-    "X-Forefront-Antispam-Report: CIP:198.51.100.1;CTRY:US;LANG:en;SCL:1;SRV:;IPV:NSS;SFV:NSPM;",
-    "X-Virus-Scanned: Clean by MailScanner / Sophos Anti-Virus",
+    "X-Enterprise-Antispam: BCL:0;ARA:13230040|;PCL:0;",
+    "X-Gateway-Antispam-Report: CIP:198.51.100.1;CTRY:US;LANG:en;SCL:1;SRV:;IPV:NSS;SFV:NSPM;",
+    "X-Virus-Scanned: Clean by MailScanner / EnterpriseAV",
     "X-Spam-Score: -5.0",
-    "X-Barracuda-Spam-Status: No, SCORE=-3.00",
-    "X-IronPort-AV: E=Sophos;i=\"5.92,123,1234567890\"; d=\"scan'208\";a=\"123456789\"",
-    "X-MS-Exchange-Organization-SCL: 0",
+    "X-Sentinel-Spam-Status: No, SCORE=-3.00",
+    "X-MailGuard-AV: E=EnterpriseAV;i=\"5.92,123,1234567890\"; d=\"scan'208\";a=\"123456789\"",
+    "X-Enterprise-Mail-SCL: 0",
 ]
 
 
@@ -524,5 +525,112 @@ class SubjectMetadataAttack(TargetedMetadataTransformation):
         if best_candidate_text is not None and best_conf < original_conf:
             current_text = best_candidate_text
             budget.consume(1)
+
+        return current_text
+
+
+# ---------------------------------------------------------------------------
+# 6. NeutralPaddingControl (Length-Dilution Scientific Control Baseline)
+# ---------------------------------------------------------------------------
+
+DEFAULT_NEUTRAL_PADDING_CANDIDATES = [
+    (
+        "Northern coastal regions experience moderate seasonal rainfall throughout autumn "
+        "months while inland mountain valleys remain comparatively dry overall."
+    ),
+    (
+        "Several historical stone bridges across central river basins preserve traditional "
+        "masonry arches constructed during earlier regional infrastructure periods."
+    ),
+    (
+        "Temperate forest canopies contain diverse deciduous tree species alongside "
+        "understory ferns mosses and seasonal woodland flowering plants nearby."
+    ),
+    (
+        "Astronomical observatories positioned along high elevation plateaus monitor "
+        "atmospheric clarity thermal stability and nocturnal sky brightness levels today."
+    ),
+    (
+        "Geological strata exposed along canyon walls illustrate gradual sedimentary "
+        "deposition cycles across successive continental marine boundary intervals clearly."
+    ),
+]
+
+
+def _inject_neutral_line(text: str, line: str, candidates: Sequence[str] = DEFAULT_NEUTRAL_PADDING_CANDIDATES) -> str:
+    """
+    Prepends a neutral filler line matching `_inject_header(..., replace_regex=None)`:
+    uses double-newline separation on the first prepended block and single-newline
+    stacking on subsequent prepended lines.
+    """
+    clean_line = line.strip()
+    match = re.search(r"\r?\n\r?\n", text)
+    if match:
+        prefix_lines = [ln.strip() for ln in text[: match.start()].splitlines() if ln.strip()]
+        cand_set = {c.strip() for c in candidates}
+        if prefix_lines and all(ln in cand_set for ln in prefix_lines):
+            return clean_line + "\n" + text
+    return clean_line + "\n\n" + text
+
+
+class NeutralPaddingControl(TargetedMetadataTransformation):
+    """
+    Length-matched neutral padding control baseline isolating bag-of-words L2-norm
+    length dilution and context-window truncation from RFC 5322 header token shortcuts.
+
+    Matches `ReceivedRoutingAttack` in candidate count (5), word length (~18 words/line),
+    prepended envelope position, and per-step budget consumption, while using strictly
+    domain-neutral encyclopedic English sentences with zero RFC 5322 headers, URLs, or
+    enterprise/security vocabulary. Excluded from `combine_all`.
+    """
+
+    def __init__(
+        self,
+        name: str = "neutral_padding_control",
+        target_model_oracle: Optional[Callable[[str], Tuple[str, float]]] = None,
+        candidates: Optional[List[str]] = None,
+    ):
+        super().__init__(name, target_model_oracle)
+        self.candidates = candidates or list(DEFAULT_NEUTRAL_PADDING_CANDIDATES)
+
+    def _apply(self, text: str, budget: PerturbationBudget, word_ranking=None) -> str:
+        if not text or not text.strip() or budget.remaining <= 0:
+            return text
+
+        oracle = self.oracle
+        if oracle is None:
+            raise ValueError(f"{self.name} requires a target_model_oracle.")
+
+        original_label, original_conf = oracle(text)
+        current_text = text
+
+        while budget.remaining > 0:
+            best_candidate_text = None
+            best_conf = float("inf")
+
+            for cand_line in self.candidates:
+                candidate_text = _inject_neutral_line(
+                    current_text, cand_line, candidates=self.candidates
+                )
+                if candidate_text == current_text:
+                    continue
+
+                pred_label, pred_conf = oracle(candidate_text)
+
+                if pred_label != original_label:
+                    budget.consume(1)
+                    return candidate_text
+
+                if pred_conf < best_conf:
+                    best_conf = pred_conf
+                    best_candidate_text = candidate_text
+
+            if best_candidate_text is not None and best_conf < original_conf:
+                current_text = best_candidate_text
+                original_conf = best_conf
+                budget.consume(1)
+                break
+            else:
+                break
 
         return current_text

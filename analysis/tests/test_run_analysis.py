@@ -1021,8 +1021,8 @@ def test_greedy_mode_stops_querying_oracle_after_evasion_or_exhaustion(tmp_path)
     oracle_queries = []
 
     def score_text(t: str) -> float:
-        # As soon as "support@microsoft.com" is injected by SenderHeaderAttack, flip to benign (0.15)
-        if "support@microsoft.com" in t:
+        # As soon as "support@meridian-corp.org" is injected by SenderHeaderAttack, flip to benign (0.15)
+        if "support@meridian-corp.org" in t:
             return 0.15
         return 0.92
 
@@ -1381,6 +1381,40 @@ def test_resolve_results_directory_single_run_saves_inside_timestamp_folder(tmp_
     base_dir_from_root, detector_dirs_from_root = resolve_results_directory(str(results_root))
     assert base_dir_from_root == ts_dir
     assert detector_dirs_from_root == [ts_dir]
+
+
+def test_paper_benchmark_presets_and_holdout_leakage_guard():
+    """Verify paper/control attacker presets and holdout isolation enforcement."""
+    from run_analysis import (
+        PROJECT_ROOT,
+        load_malicious_samples,
+        resolve_attacker,
+        resolve_attackers,
+        verify_holdout_isolation,
+    )
+
+    paper_keys = resolve_attackers("paper")
+    assert len(paper_keys) == 15
+    assert "neutral_padding" in paper_keys
+    assert "combine_all" in paper_keys
+
+    key, spec = resolve_attacker("neutral_padding")
+    assert key == "neutral_padding"
+    assert spec["category"] == "control"
+
+    with pytest.raises(ValueError, match="scientific control baseline"):
+        resolve_attacker("neutral_padding+homoglyph")
+
+    holdout_path = PROJECT_ROOT / "datasets" / "texts_holdout.json"
+    leaked_path = PROJECT_ROOT / "datasets" / "texts.json"
+    if holdout_path.exists() and leaked_path.exists():
+        holdout_samples = load_malicious_samples(holdout_path, 50, seed=3073)
+        verify_holdout_isolation(holdout_samples, holdout_path, allow_train_overlap=False)
+
+        leaked_samples = load_malicious_samples(leaked_path, 50, seed=3073)
+        with pytest.raises(RuntimeError, match="Data leakage guard triggered"):
+            verify_holdout_isolation(leaked_samples, leaked_path, allow_train_overlap=False)
+
 
 
 

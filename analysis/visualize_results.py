@@ -164,6 +164,7 @@ ATTACK_CATEGORY_MAP = {
     "x_header": "metadata",
     "subject_metadata": "metadata",
     "timestamp": "metadata",
+    "neutral_padding": "control",
     "combined": "combined",
     "combine_all": "combined",
 }
@@ -281,17 +282,16 @@ def classify_perturbation_attack(
         return "auth_results"
     if re.search(r"\bReceived:\s*from\b", combined_str):
         return "received_routing"
-    if re.search(
-        r"\bX-(?:Spam|Microsoft-Antispam|Forefront|Virus-Scanned|Barracuda|IronPort|MS-Exchange)",
-        combined_str,
-    ):
+    if re.search(r"\bX-[A-Za-z0-9-]+:", combined_str):
         return "x_header"
     if re.search(r"\bSubject:", combined_str):
         return "subject_metadata"
     if re.search(r"\bDate:", combined_str):
         return "timestamp"
 
-    # 8. Semantic Content Synonym Substitution or Single-Attack Fallback
+    # 8. Control Baseline, Semantic Synonym Substitution, or Single-Attack Fallback
+    if fallback_attacker_id == "neutral_padding":
+        return "neutral_padding"
     if fallback_attacker_id in CONSTITUENT_ATTACK_INFO:
         return fallback_attacker_id
     return "textfooler"

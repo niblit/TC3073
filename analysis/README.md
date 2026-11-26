@@ -12,7 +12,7 @@ The project relies on the same Nix environment as the other modules. Enter the e
 nix develop
 ```
 
-*Note: Make sure the `detector_zoo` has a trained baseline model available, and that you have the dataset (`texts.json`) placed at the project root.*
+*Note: Make sure the `detector_zoo` has trained models available, and that the leak-free holdout dataset (`datasets/texts_holdout.json`, generated via `python datasets/build_holdout_texts.py`) is present.*
 
 ## Running the Analysis
 

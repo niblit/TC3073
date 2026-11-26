@@ -83,6 +83,8 @@ def test_attacks_module_exports():
         "compute_word_ranking",
         "CombinedAttack",
         "PerWordBestOfKAttack",
+        "NeutralPaddingControl",
+        "DEFAULT_NEUTRAL_PADDING_CANDIDATES",
         "ATTACK_PRIORITY_ORDER",
         "DEFAULT_COMBINED_ATTACKS",
         "ALL_COMBINED_ATTACKS",
@@ -96,11 +98,13 @@ def test_attacks_module_exports():
 
 def test_html_comment_injection():
     """Verify HTMLCommentInjection transformation and budget consumption."""
+    import random
+    random.seed(42)
     attack = HTMLCommentInjection(num_injections=2)
     budget = PerturbationBudget(max_edits=5)
     text = "Please verify your account details today."
     
-    result = attack.transform(text, budget)
+    result = attack._apply(text, budget)
     assert budget.consumed == 2
     assert "<!-- " in result
     assert "-->" in result

@@ -16,13 +16,14 @@ Currently, it implements the **TextFooler** algorithm (Jin et al., 2019), a stro
     - `DOMWrapperAttack`: Encloses content blocks in structural DOM elements (tables, divisions, articles).
     - `HomoglyphSubstitutionAttack`: Substitutes Latin characters with visually identical Unicode confusables.
     - `HTMLCommentInjection`: (Legacy static) Injects benign HTML comments.
-  - `metadata_attack.py`: Delivery metadata transformations targeting envelope and headers:
+  - `metadata_attack.py`: Delivery metadata transformations targeting envelope and headers (using strictly fictitious enterprise domains and RFC 5737 documentation IPs):
     - `SenderHeaderAttack`: Manipulates From, Reply-To, and Return-Path headers.
     - `AuthenticationResultsAttack`: Injects or replaces SPF, DKIM, and DMARC pass headers.
     - `ReceivedRoutingAttack`: Injects simulated benign MTA relay hops.
-    - `XHeaderInjectionAttack`: Injects enterprise anti-spam gateway verdicts.
+    - `XHeaderInjectionAttack`: Injects vendor-neutral anti-spam gateway verdicts.
     - `SubjectMetadataAttack`: Perturbs Subject headers with benign prefixes, tags, and urgency softening.
     - `TimestampSpoofing`: (Legacy static) Delivery timestamp modification.
+    - `NeutralPaddingControl`: Scientific length-dilution control baseline (~18 neutral words/line, excluded from `combine_all`).
 - `harness/budget.py`: Tracks and enforces the perturbation budget (`max_edits`).
 - `harness/nlp_loader.py`: Lazy-loads heavy NLP models (spaCy, Universal Sentence Encoder, Counter-fitted Word Vectors).
 - `main.py`: The CLI entry point to apply an attack to an input text using a specific target model oracle.

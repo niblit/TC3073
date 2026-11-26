@@ -20,6 +20,8 @@ from harness.attacks import (
     ReceivedRoutingAttack,
     XHeaderInjectionAttack,
     SubjectMetadataAttack,
+    NeutralPaddingControl,
+    DEFAULT_NEUTRAL_PADDING_CANDIDATES,
     # Structure attacks
     ZeroWidthInjectionAttack,
     HTMLTagInjectionAttack,
@@ -94,7 +96,7 @@ class TestMetadataAttacks:
     def test_sender_header_attack_label_flip(self):
         """SenderHeaderAttack terminates early upon label flip and consumes 1 budget."""
         def oracle(text):
-            if "support@microsoft.com" in text:
+            if "support@meridian-corp.org" in text:
                 return ("benign", 0.90)
             return ("phishing", 0.95)
 
@@ -104,14 +106,14 @@ class TestMetadataAttacks:
 
         result = attack.transform(text, budget)
         assert budget.consumed == 1
-        assert "support@microsoft.com" in result
+        assert "support@meridian-corp.org" in result
 
     def test_sender_header_attack_confidence_reduction(self):
         """SenderHeaderAttack selects the candidate that minimizes confidence when no flip."""
         def oracle(text):
-            if "support@microsoft.com" in text:
+            if "support@meridian-corp.org" in text:
                 return ("phishing", 0.60)
-            if "admin@google.com" in text:
+            if "admin@vanguard-cloud.net" in text:
                 return ("phishing", 0.75)
             return ("phishing", 0.95)
 
@@ -121,7 +123,7 @@ class TestMetadataAttacks:
 
         result = attack.transform(text, budget)
         assert budget.consumed == 1
-        assert "support@microsoft.com" in result
+        assert "support@meridian-corp.org" in result
 
     def test_authentication_results_attack_label_flip(self):
         """AuthenticationResultsAttack flips label when authentic pass header is injected."""
@@ -142,7 +144,7 @@ class TestMetadataAttacks:
     def test_received_routing_attack_prepends_hop(self):
         """ReceivedRoutingAttack inserts benign MTA hops to lower phishing confidence."""
         def oracle(text):
-            if "mail-sor-f65.google.com" in text:
+            if "mail-relay-01.meridian-corp.org" in text:
                 return ("benign", 0.85)
             return ("phishing", 0.90)
 
@@ -152,7 +154,7 @@ class TestMetadataAttacks:
 
         result = attack.transform(text, budget)
         assert budget.consumed == 1
-        assert "Received: from mail-sor-f65.google.com" in result
+        assert "Received: from mail-relay-01.meridian-corp.org" in result
 
     def test_x_header_injection_attack_minimizes_confidence(self):
         """XHeaderInjectionAttack injects anti-spam score headers to evade detection."""
@@ -742,4 +744,59 @@ class TestCombinedBestOfKAttack:
         assert budget.applied_attacks[0]["attack"] == "auth_results"
         assert budget.applied_attacks[0]["flipped"] is True
         assert budget.applied_attacks[0]["flipped_conf"] == pytest.approx(0.96)
+
+
+class TestNeutralPaddingControlAndBrandHygiene:
+    """Verify NeutralPaddingControl length parity, exclusion from combine_all, and fictitious templates."""
+
+    def test_neutral_padding_control_mechanics_and_length_parity(self):
+        import re
+        from harness.attacks.metadata_attack import DEFAULT_ROUTING_CANDIDATES
+
+        routing_mean_words = sum(len(c.split()) for c in DEFAULT_ROUTING_CANDIDATES) / len(DEFAULT_ROUTING_CANDIDATES)
+        neutral_mean_words = sum(len(c.split()) for c in DEFAULT_NEUTRAL_PADDING_CANDIDATES) / len(DEFAULT_NEUTRAL_PADDING_CANDIDATES)
+        assert abs(neutral_mean_words - routing_mean_words) <= 1.0
+
+        # Ensure zero RFC 5322 header prefixes in neutral padding lines
+        for line in DEFAULT_NEUTRAL_PADDING_CANDIDATES:
+            assert not re.match(r"^[A-Za-z0-9\-]+:\s+", line)
+
+        def oracle(t):
+            if "Northern coastal regions" in t:
+                return ("benign", 0.88)
+            return ("phishing", 0.94)
+
+        ctrl = NeutralPaddingControl(target_model_oracle=oracle)
+        budget = PerturbationBudget(max_edits=2)
+        res = ctrl.transform("Urgent verify payment transfer now", budget)
+        assert budget.consumed == 1
+        assert res.startswith("Northern coastal regions")
+        assert "\n\nUrgent verify payment transfer now" in res
+
+    def test_neutral_padding_excluded_from_combine_all(self):
+        comb = CombinedAttack(attacks="combine_all")
+        assert "neutral_padding" not in comb.constituent_keys
+        assert len(comb.constituent_keys) == 13
+
+    def test_metadata_templates_contain_no_real_brands(self):
+        import re
+        from harness.attacks.metadata_attack import (
+            DEFAULT_SENDER_CANDIDATES,
+            DEFAULT_AUTH_CANDIDATES,
+            DEFAULT_ROUTING_CANDIDATES,
+            DEFAULT_XHEADER_CANDIDATES,
+        )
+        forbidden = re.compile(
+            r"\b(microsoft|google|apple|paypal|amazon|github|cisco|outlook|sendgrid|amazonses|barracuda|ironport|sophos|pphosted|ppops)\b",
+            re.IGNORECASE,
+        )
+        for pool in (
+            DEFAULT_SENDER_CANDIDATES,
+            DEFAULT_AUTH_CANDIDATES,
+            DEFAULT_ROUTING_CANDIDATES,
+            DEFAULT_XHEADER_CANDIDATES,
+        ):
+            for entry in pool:
+                assert not forbidden.search(entry), f"Real brand found in template: {entry}"
+
 

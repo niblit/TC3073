@@ -66,6 +66,8 @@ from harness.attacks import (
     ReceivedRoutingAttack,
     XHeaderInjectionAttack,
     SubjectMetadataAttack,
+    # Control Baseline
+    NeutralPaddingControl,
     # Combined (Per-Word Best-of-K)
     CombinedAttack,
     PerWordBestOfKAttack,
@@ -187,6 +189,19 @@ ATTACKER_REGISTRY = {
         "category": "metadata",
     },
 
+    # ── Length-Dilution Scientific Control Baseline ──
+    "neutral_padding": {
+        "factory": lambda oracle: NeutralPaddingControl(target_model_oracle=oracle),
+        "display_name": "Neutral Padding Control",
+        "aliases": [
+            "padding_control",
+            "length_control",
+            "neutral_control",
+            "neutral_padding_control",
+        ],
+        "category": "control",
+    },
+
     # ── Combined Multi-Attack Best-of-K Presets ──
     "combined": {
         "factory": lambda oracle: CombinedAttack(
@@ -224,6 +239,26 @@ NEW_ATTACKERS = [
     "dom_wrapper",
     "homoglyph",
 ]
+
+SINGLE_13_ATTACKERS = [
+    "sender_header",
+    "auth_results",
+    "received_routing",
+    "x_header",
+    "subject_metadata",
+    "zero_width",
+    "html_tag",
+    "html_entity",
+    "dom_wrapper",
+    "homoglyph",
+    "textfooler",
+    "html_comment",
+    "timestamp",
+]
+
+SINGLE_13_PLUS_CONTROL_ATTACKERS = SINGLE_13_ATTACKERS + ["neutral_padding"]
+
+PAPER_BENCHMARK_ATTACKERS = SINGLE_13_ATTACKERS + ["neutral_padding", "combine_all"]
 
 
 def resolve_detector(name_or_alias: str):
@@ -326,6 +361,10 @@ def resolve_attacker(name_or_alias: str):
                 )
             else:
                 sub_key, sub_spec = resolve_attacker(part)
+                if sub_spec.get("category") == "control":
+                    raise ValueError(
+                        f"'{sub_key}' is a scientific control baseline and cannot be combined into a multi-attack optimizer."
+                    )
                 if "constituent_attacks" in sub_spec:
                     constituent_keys.extend(sub_spec["constituent_attacks"])
                 else:
@@ -366,6 +405,14 @@ def resolve_attackers(spec_str: str) -> list[str]:
     clean = spec_str.strip().lower()
     if clean in ("new", "new_attacks", "new_attack"):
         return list(NEW_ATTACKERS)
+    if clean in ("single13", "single_13", "13"):
+        return list(SINGLE_13_ATTACKERS)
+    if clean in ("single13_plus_control", "single_plus_control", "13_plus_control"):
+        return list(SINGLE_13_PLUS_CONTROL_ATTACKERS)
+    if clean in ("control", "controls"):
+        return ["neutral_padding"]
+    if clean in ("paper", "benchmark", "paper_all"):
+        return list(PAPER_BENCHMARK_ATTACKERS)
     if clean == "all":
         return list(ATTACKER_REGISTRY.keys())
     if clean in ("metadata", "meta"):
@@ -379,6 +426,21 @@ def resolve_attackers(spec_str: str) -> list[str]:
         p_clean = part.lower().replace("-", "_")
         if p_clean in ("new", "new_attacks", "new_attack"):
             for k in NEW_ATTACKERS:
+                if k not in resolved_keys:
+                    resolved_keys.append(k)
+        elif p_clean in ("single13", "single_13", "13"):
+            for k in SINGLE_13_ATTACKERS:
+                if k not in resolved_keys:
+                    resolved_keys.append(k)
+        elif p_clean in ("single13_plus_control", "single_plus_control", "13_plus_control"):
+            for k in SINGLE_13_PLUS_CONTROL_ATTACKERS:
+                if k not in resolved_keys:
+                    resolved_keys.append(k)
+        elif p_clean in ("control", "controls"):
+            if "neutral_padding" not in resolved_keys:
+                resolved_keys.append("neutral_padding")
+        elif p_clean in ("paper", "benchmark", "paper_all"):
+            for k in PAPER_BENCHMARK_ATTACKERS:
                 if k not in resolved_keys:
                     resolved_keys.append(k)
         elif p_clean in ("metadata", "meta"):
@@ -399,6 +461,59 @@ def resolve_attackers(spec_str: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # Data & Model Helpers
 # ---------------------------------------------------------------------------
+_CACHED_TRAIN_STRINGS: set[str] | None = None
+
+
+def _get_detector_zoo_train_strings() -> set[str]:
+    """
+    Lazily loads and caches the exact 80% X_train string set from
+    `datasets/combined_reduced.json` (seed=42, test_size=0.2) used to train
+    the Detector Zoo, enabling fast zero-leakage verification.
+    """
+    global _CACHED_TRAIN_STRINGS
+    if _CACHED_TRAIN_STRINGS is None:
+        combined_path = PROJECT_ROOT / "datasets" / "combined_reduced.json"
+        if not combined_path.exists():
+            _CACHED_TRAIN_STRINGS = set()
+        else:
+            from src.data_loader import load_data
+            from src.splitter import split_data
+            df = load_data(str(combined_path)).dropna(subset=["text", "label"])
+            X_train, _, _, _ = split_data(df, test_size=0.2, random_state=42)
+            _CACHED_TRAIN_STRINGS = set(X_train)
+    return _CACHED_TRAIN_STRINGS
+
+
+def verify_holdout_isolation(samples: list[dict], data_file: Path, allow_train_overlap: bool = False) -> None:
+    """
+    Enforces strict holdout isolation whenever evaluating on datasets inside
+    `PROJECT_ROOT / datasets`. Raises RuntimeError if any sampled message
+    appeared in the Detector Zoo's 80% training split unless `allow_train_overlap=True`.
+    """
+    if allow_train_overlap or not samples:
+        return
+    datasets_dir = (PROJECT_ROOT / "datasets").resolve()
+    try:
+        resolved_data = data_file.resolve()
+    except OSError:
+        return
+    if resolved_data.parent != datasets_dir:
+        return
+
+    train_strings = _get_detector_zoo_train_strings()
+    if not train_strings:
+        return
+
+    leaked_count = sum(1 for s in samples if s.get("text") in train_strings)
+    if leaked_count > 0:
+        raise RuntimeError(
+            f"Data leakage guard triggered: {leaked_count}/{len(samples)} sampled messages from "
+            f"'{data_file.name}' overlap the Detector Zoo 80% training split (combined_reduced.json, seed=42). "
+            f"Use 'datasets/texts_holdout.json' (built via 'python datasets/build_holdout_texts.py') "
+            f"or pass --allow-train-overlap if intentional."
+        )
+
+
 def load_malicious_samples(path: Path, n: int, seed: int) -> list[dict]:
     """
     Loads up to n malicious samples (label=1) deterministically using the given seed.
@@ -660,12 +775,13 @@ def run_single_analysis(
     word_rankings: dict[int, list[tuple[int, float]]] | list[list[tuple[int, float]]] | None = None,
     greedy: bool = True,
     non_greedy: bool = False,
+    allow_train_overlap: bool = False,
 ):
     use_greedy = False if non_greedy else bool(greedy)
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
 
-    data_file = Path(data_path) if data_path else PROJECT_ROOT / "datasets" / "texts.json"
+    data_file = Path(data_path) if data_path else PROJECT_ROOT / "datasets" / "texts_holdout.json"
     detector, det_key, det_spec, resolved_model_path = load_detector(detector_type, model_path)
     att_key, att_spec = resolve_attacker(attacker_type)
 
@@ -679,8 +795,9 @@ def run_single_analysis(
     # Calculate budget sweep
     budgets = [round((i / budget_steps) * max_budget, 4) for i in range(1, budget_steps + 1)]
 
-    # Load dataset
+    # Load dataset & verify zero training-split leakage
     samples = load_malicious_samples(data_file, num_samples, seed)
+    verify_holdout_isolation(samples, data_file, allow_train_overlap=allow_train_overlap)
 
     # Initialize oracle and attacker
     oracle = create_oracle(detector)
@@ -1149,7 +1266,14 @@ def parse_args():
         "--data-path",
         type=str,
         default=None,
-        help="Custom path to texts.json dataset."
+        help="Custom path to evaluation JSON dataset (defaults to datasets/texts_holdout.json)."
+    )
+    parser.add_argument(
+        "--allow-train-overlap",
+        dest="allow_train_overlap",
+        action="store_true",
+        default=False,
+        help="Bypass the holdout data-leakage guard when intentionally evaluating on non-holdout splits."
     )
     parser.add_argument(
         "--output-dir", "-o",
@@ -1271,6 +1395,7 @@ def main():
                     word_rankings=shared_word_rankings,
                     greedy=args.greedy,
                     non_greedy=args.non_greedy,
+                    allow_train_overlap=args.allow_train_overlap,
                 )
     finally:
         if shared_pool is not None:

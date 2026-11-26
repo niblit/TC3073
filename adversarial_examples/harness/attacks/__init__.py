@@ -28,6 +28,8 @@ from harness.attacks.metadata_attack import (
     ReceivedRoutingAttack,
     XHeaderInjectionAttack,
     SubjectMetadataAttack,
+    NeutralPaddingControl,
+    DEFAULT_NEUTRAL_PADDING_CANDIDATES,
 )
 from harness.attacks.structure_attack import (
     HTMLCommentInjection,
@@ -68,6 +70,9 @@ __all__ = [
     "ReceivedRoutingAttack",
     "XHeaderInjectionAttack",
     "SubjectMetadataAttack",
+    # Control Baseline
+    "NeutralPaddingControl",
+    "DEFAULT_NEUTRAL_PADDING_CANDIDATES",
     # Combined (Per-Word Best-of-K)
     "CombinedAttack",
     "PerWordBestOfKAttack",
